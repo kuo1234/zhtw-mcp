@@ -172,14 +172,26 @@ fn markdown_link_text_checked() {
 }
 
 #[test]
-fn markdown_link_url_not_excluded_for_spelling() {
-    // Non-URL text inside Markdown link parens is still checked. Note: the URL
-    // part of a markdown link is excluded as a URL, but non-URL text inside
-    // parens is still checked.
+fn markdown_relative_destination_excluded_for_spelling() {
+    // This asserted the opposite until the exclusion pass learned what a link
+    // is, and the comment it carried described the old implementation rather
+    // than a decision: only a destination carrying a URL scheme was excluded,
+    // because only the URL regex was looking, so a relative path or an anchor
+    // was read as prose.
+    //
+    // A destination is an address, and the term in one belongs to a filename
+    // somebody has to rename, not to a sentence. Reporting it is at best advice
+    // the linter cannot act on, and at worst a fix that rewrites the address
+    // and leaves the link pointing nowhere. The link text one bracket to the
+    // left is the prose, and markdown_link_text_checked above holds it in the
+    // scan.
     let scanner = Scanner::new(vec![spelling("錯誤", &["正確"])], vec![]);
-    let issues = scanner.scan("這是 [hi](錯誤) 的文字").issues;
-    assert_eq!(issues.len(), 1);
-    assert_eq!(issues[0].found, "錯誤");
+    assert!(scanner.scan("這是 [hi](錯誤) 的文字").issues.is_empty());
+    assert!(scanner.scan("這是 [hi](#錯誤) 的文字").issues.is_empty());
+    assert!(scanner
+        .scan("這是 [hi](docs/錯誤.md) 的文字")
+        .issues
+        .is_empty());
 }
 
 #[test]

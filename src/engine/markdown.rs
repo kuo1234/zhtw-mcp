@@ -6,7 +6,7 @@
 //
 // Returns byte ranges to exclude before scanning.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use super::excluded::{merge_ranges_pub, ByteRange};
 use super::html_lang::LangScopes;
@@ -136,6 +136,17 @@ pub fn build_markdown_excluded_ranges_with_options(
 
     let parser_opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
     let parser = Parser::new_ext(text, parser_opts);
+
+    // Link reference definitions never reach the event stream: the parser
+    // resolves them in its first pass and emits nothing where they stood, so
+    // the exclusion builder would not see them at all. Collected here rather
+    // than in the loop below because the borrow has to end before
+    // into_offset_iter takes the parser.
+    let bytes = text.as_bytes();
+    for def in parser.reference_definitions().iter() {
+        push_definition_syntax_ranges(bytes, &def.1.span, &mut ranges);
+    }
+
     let mut in_code_block = false;
     let mut code_block_start = 0usize;
     let mut blockquote_depth: usize = 0;
@@ -174,6 +185,12 @@ pub fn build_markdown_excluded_ranges_with_options(
                 }
             }
 
+            // A link's address, and a reference label, are machine identifiers
+            // rather than prose. The text and any title are left in the scan.
+            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. }) => {
+                push_link_syntax_ranges(text.as_bytes(), &range, link_type, &mut ranges);
+            }
+
             // Inline code: exclude the span including backticks.
             Event::Code(_) => {
                 ranges.push(ByteRange {
@@ -203,6 +220,231 @@ pub fn build_markdown_excluded_ranges_with_options(
 
     // Sort and merge (frontmatter + parser ranges may overlap).
     merge_ranges_pub(ranges)
+}
+
+// Link syntax
+//
+// A link destination is a machine address: a path, an anchor, a URL. Scanning
+// it as prose is how the CJK-to-Latin spacing rule reaches into an anchor such
+// as 標題abc, writes the space it is right to want between 題 and abc, and
+// leaves a working link pointing nowhere. A linter that breaks the document it
+// was asked to check is worse than one that missed something.
+//
+// Three constructs carry an address, and all three come from pulldown-cmark
+// rather than from a pattern, so nothing here can fire on prose that merely
+// looks like a link: the parser already resolved these.
+//
+//   [text](dest "title")     the inline form
+//   [text][label]            the reference, whose label has to survive intact
+//   [label]: dest "title"    the definition the reference resolves through
+//
+// What stays scannable is everything a reader sees. The link text is prose, and
+// so are the words of a title; only the quotes around it come out, because
+// converting those to corner brackets stops the link parsing. A shortcut
+// reference, a label in brackets with no second pair after it, is its own
+// visible text and is left alone entirely.
+
+/// True when the byte at `i` is preceded by an odd number of backslashes, and
+/// therefore escaped.  CommonMark allows `\)` inside a destination, and a
+/// bracket matcher that counts one closes the span in the wrong place.
+fn is_escaped(bytes: &[u8], i: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut j = i;
+    while j > 0 && bytes[j - 1] == b'\\' {
+        backslashes += 1;
+        j -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// Walk back from a closing delimiter to the one that opens it.
+///
+/// Backwards rather than forwards because the span starts with the link text,
+/// which may hold brackets of its own: `[a (b) c](dest)` balances its own pair
+/// before the search reaches it, so the depth counter is at zero by the time it
+/// arrives at the delimiter that matters.
+fn matching_open(bytes: &[u8], close: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = close;
+    loop {
+        if !is_escaped(bytes, i) {
+            if bytes[i] == close_ch {
+                depth += 1;
+            } else if bytes[i] == open_ch {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// The destination inside `bytes[from..to]`, as an absolute byte range.
+///
+/// Two spellings, both from CommonMark: `<a href>` delimits with angle brackets
+/// and may hold spaces, and the bare form runs to the first whitespace, which
+/// is
+/// where an optional title would begin.  The angle brackets come out with the
+/// address because they are syntax; a title never does.
+fn destination_span(bytes: &[u8], from: usize, to: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i < to && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= to {
+        return None;
+    }
+    if bytes[i] == b'<' {
+        let mut j = i + 1;
+        while j < to && !(bytes[j] == b'>' && !is_escaped(bytes, j)) {
+            j += 1;
+        }
+        return Some((i, (j + 1).min(to)));
+    }
+    let start = i;
+    while i < to && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    Some((start, i))
+}
+
+/// A title's quotes, but not the words between them.
+///
+/// The quotes are syntax and the title is a tooltip a reader sees, so the pair
+/// comes out and the prose stays in. Leaving them in is not harmless: the
+/// punctuation rule is right that an ASCII quote wrapping Chinese should be a
+/// corner bracket, and writing that turns a titled link into something
+/// CommonMark no longer reads as a link at all.
+fn push_title_delimiters(bytes: &[u8], from: usize, to: usize, ranges: &mut Vec<ByteRange>) {
+    let mut i = from;
+    while i < to && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // The three spellings CommonMark allows. Anything else is not a title, and
+    // is likelier a destination this scan misread than a form worth guessing
+    // at.
+    let closer = match bytes.get(i) {
+        Some(b'"') => b'"',
+        Some(b'\'') => b'\'',
+        Some(b'(') => b')',
+        _ => return,
+    };
+    let mut j = i + 1;
+    while j < to && !(bytes[j] == closer && !is_escaped(bytes, j)) {
+        j += 1;
+    }
+    ranges.push(ByteRange {
+        start: i,
+        end: i + 1,
+    });
+    if j < to {
+        ranges.push(ByteRange {
+            start: j,
+            end: j + 1,
+        });
+    }
+}
+
+/// The syntax ranges of one link or image, given the source span
+/// pulldown-cmark reported for it and the form it took.
+///
+/// Nothing for a link whose address is not written in this span: a shortcut
+/// reference is nothing but its own text, and an autolink is a bare URL that
+/// the URL pass in `excluded.rs` already covers.
+fn push_link_syntax_ranges(
+    bytes: &[u8],
+    span: &std::ops::Range<usize>,
+    kind: LinkType,
+    ranges: &mut Vec<ByteRange>,
+) {
+    match kind {
+        // [text](dest "title") -- the address, and the quotes around the title.
+        LinkType::Inline => {
+            let Some(close) = span.end.checked_sub(1) else {
+                return;
+            };
+            if bytes.get(close) != Some(&b')') {
+                return;
+            }
+            let Some(open) = matching_open(bytes, close, b'(', b')') else {
+                return;
+            };
+
+            // The delimiter has to abut the link text's own closing bracket.
+            // Anything else means the scan landed somewhere unexpected, and
+            // guessing on a write path is how a fix reaches bytes nobody meant
+            // to touch.
+            if open == 0 || bytes[open - 1] != b']' {
+                return;
+            }
+            let Some((start, end)) = destination_span(bytes, open + 1, close) else {
+                return;
+            };
+            ranges.push(ByteRange { start, end });
+            push_title_delimiters(bytes, end, close, ranges);
+        }
+
+        // [text][label] -- the label is an identifier, and a space written into
+        // it stops it matching its definition. Brackets included: they are the
+        // only thing telling the two halves apart.
+        LinkType::Reference | LinkType::Collapsed => {
+            let Some(close) = span.end.checked_sub(1) else {
+                return;
+            };
+            if bytes.get(close) != Some(&b']') {
+                return;
+            }
+            let Some(open) = matching_open(bytes, close, b'[', b']') else {
+                return;
+            };
+            if open > span.start {
+                ranges.push(ByteRange {
+                    start: open,
+                    end: span.end,
+                });
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// The syntax range of a link reference definition: its label through its
+/// address, leaving any title behind.
+///
+/// Without this the reference form is only half covered. Writing a space into
+/// `[標題abc]: docs/x.md` breaks the link exactly as writing one into the
+/// reference does, and a fix for one that leaves the other is not a fix.
+fn push_definition_syntax_ranges(
+    bytes: &[u8],
+    span: &std::ops::Range<usize>,
+    ranges: &mut Vec<ByteRange>,
+) {
+    let mut i = span.start;
+    while i < span.end && !(bytes[i] == b']' && !is_escaped(bytes, i)) {
+        i += 1;
+    }
+    if i >= span.end || bytes.get(i + 1) != Some(&b':') {
+        return;
+    }
+    let Some((_, end)) = destination_span(bytes, i + 2, span.end) else {
+        return;
+    };
+
+    // One range from the opening bracket through the address: the label, the
+    // colon and the destination are all machine-read, and none of what sits
+    // between them is prose.
+    ranges.push(ByteRange {
+        start: span.start,
+        end,
+    });
+    push_title_delimiters(bytes, end, span.end, ranges);
 }
 
 /// Build excluded byte ranges for YAML structural tokens.

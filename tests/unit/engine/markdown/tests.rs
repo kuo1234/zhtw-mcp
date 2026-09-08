@@ -369,3 +369,130 @@ fn a_lang_tag_written_inside_a_fence_scopes_nothing() {
     let md = "```html\n<span lang=\"en\">\n```\n\n他說, 對吧。\n";
     assert!(!excluded_covers(md, "他說, 對吧。"));
 }
+
+// Link syntax exclusion
+//
+// A destination is an address, and the spacing rule writing the space it is
+// right to want between CJK and Latin turns a working anchor into a dead one.
+// These hold the line between what a reader sees, which stays in the scan, and
+// what a parser reads, which comes out of it.
+
+/// True when every byte of `needle` in `md` falls inside some excluded range.
+fn excluded(md: &str, needle: &str) -> bool {
+    let at = md
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in fixture"));
+    let ranges = build_markdown_excluded_ranges(md);
+    (at..at + needle.len()).all(|i| ranges.iter().any(|r| i >= r.start && i < r.end))
+}
+
+/// True when no byte of `needle` in `md` falls inside any excluded range.
+fn scanned(md: &str, needle: &str) -> bool {
+    let at = md
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in fixture"));
+    let ranges = build_markdown_excluded_ranges(md);
+    (at..at + needle.len()).all(|i| !ranges.iter().any(|r| i >= r.start && i < r.end))
+}
+
+#[test]
+fn inline_link_destination_is_excluded_and_its_text_is_not() {
+    let md = "見 [說明文字](#中文錨點abc) 一節。\n";
+    assert!(excluded(md, "#中文錨點abc"), "the address is not prose");
+    assert!(
+        scanned(md, "說明文字"),
+        "the link text is what a reader sees"
+    );
+    assert!(scanned(md, "一節"), "prose after the link is untouched");
+}
+
+#[test]
+fn image_destination_is_excluded_and_its_alt_text_is_not() {
+    let md = "![圖說abc](圖片檔abc.png)\n";
+    assert!(excluded(md, "圖片檔abc.png"));
+    assert!(scanned(md, "圖說abc"), "alt text is prose");
+}
+
+#[test]
+fn angle_bracketed_destination_is_excluded_with_its_brackets() {
+    // The bracketed form is the only one that may hold a space, and the
+    // brackets are what say so.
+    let md = "[文字](<有 空格abc.md>)\n";
+    assert!(excluded(md, "<有 空格abc.md>"));
+}
+
+#[test]
+fn destination_holding_balanced_parens_is_excluded_whole() {
+    // The backward scan has to pass the link text's own parens without
+    // stopping, and stop at the delimiter rather than inside the address.
+    let md = "[a (b) c](路徑abc(x).md)\n";
+    assert!(excluded(md, "路徑abc(x).md"));
+    assert!(scanned(md, "a (b) c"));
+}
+
+#[test]
+fn escaped_paren_does_not_close_the_destination_early() {
+    let md = "[文字](路徑abc\\).md)\n";
+    assert!(excluded(md, "路徑abc\\).md"));
+}
+
+#[test]
+fn title_words_stay_in_the_scan_and_its_quotes_do_not() {
+    // The words are a tooltip a reader sees. The quotes are syntax, and the
+    // punctuation rule rewriting them to corner brackets stops the link parsing
+    // at all.
+    let md = "[文字](路徑.md \"標題裡的軟件\")\n";
+    assert!(scanned(md, "標題裡的軟件"), "a title is prose");
+    let at = md.find('"').unwrap();
+    let ranges = build_markdown_excluded_ranges(md);
+    assert!(
+        ranges.iter().any(|r| r.start == at && r.end == at + 1),
+        "the opening quote is syntax: {ranges:?}"
+    );
+}
+
+#[test]
+fn reference_label_is_excluded_and_the_link_text_is_not() {
+    let md = "見 [說明文字][錨點abc] 一節。\n\n[錨點abc]: docs/x.md\n";
+    assert!(excluded(md, "[錨點abc]"), "a label is an identifier");
+    assert!(scanned(md, "說明文字"));
+}
+
+#[test]
+fn a_shortcut_reference_is_its_own_text_and_stays_in_the_scan() {
+    // [label] with no second bracket renders the label itself, so excluding it
+    // would hide the one place the reader actually reads it.
+    let md = "見 [中文標籤abc] 一節。\n\n[中文標籤abc]: docs/x.md\n";
+    let at = md.find("中文標籤abc").expect("fixture");
+    let ranges = build_markdown_excluded_ranges(md);
+    assert!(
+        !ranges.iter().any(|r| at >= r.start && at < r.end),
+        "the visible occurrence must stay scannable: {ranges:?}"
+    );
+}
+
+#[test]
+fn definition_label_and_destination_are_excluded() {
+    // The definition never reaches the event stream, so without its own pass
+    // the reference form is only half covered: breaking the definition breaks
+    // the link exactly as breaking the reference does.
+    let md = "見 [說明][錨點abc] 一節。\n\n[錨點abc]: docs/中文檔abc.md\n";
+    assert!(excluded(md, "[錨點abc]: docs/中文檔abc.md"));
+}
+
+#[test]
+fn definition_title_words_stay_in_the_scan() {
+    let md = "[標籤]: docs/x.md \"定義裡的軟件\"\n";
+    assert!(scanned(md, "定義裡的軟件"));
+}
+
+#[test]
+fn prose_that_merely_looks_like_a_link_is_untouched() {
+    // Every range here comes from a link pulldown-cmark resolved, so a bracket
+    // and a paren sitting next to each other in ordinary prose cannot produce
+    // one.
+    let md = "這個軟件（見附錄）在 [方括號] 之後還有 (圓括號abc) 的文字。\n";
+    assert!(scanned(md, "軟件"));
+    assert!(scanned(md, "圓括號abc"));
+    assert!(scanned(md, "方括號"));
+}
