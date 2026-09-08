@@ -18,11 +18,39 @@ fn claude_code_section_contains_conventions() {
 }
 
 #[test]
+fn claude_code_section_leads_with_the_cli() {
+    // The order is the guidance. A section that offers both and names the MCP
+    // call first is the advice this project used to give, and it is what makes
+    // an agent lint its own TODO list.
+    let section = claude_code_section();
+    let cli = section
+        .find("lint <file> --fix --format agent")
+        .expect("the CLI command is the recommendation");
+    let mcp = section
+        .find("zhtw({")
+        .expect("the MCP call stays documented");
+    assert!(cli < mcp, "the CLI has to come first");
+    assert!(section.contains("zhtw-finalize"));
+}
+
+#[test]
 fn codex_instructions_use_short_server_name() {
     let instructions = codex_instructions();
     assert!(instructions.contains("codex mcp add zhtw"));
     assert!(instructions.contains("mcp__zhtw.zhtw"));
     assert!(instructions.contains("AGENTS.md"));
+}
+
+#[test]
+fn codex_instructions_lead_with_the_cli() {
+    let instructions = codex_instructions();
+    let cli = instructions
+        .find("lint <file> --fix --format agent")
+        .expect("the CLI command is the recommendation");
+    let register = instructions
+        .find("codex mcp add zhtw")
+        .expect("the registration stays documented");
+    assert!(cli < register, "the CLI has to come first");
 }
 
 #[test]

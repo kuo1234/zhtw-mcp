@@ -8,13 +8,18 @@
 
 /// Generate a CLAUDE.md section for Claude Code integration.
 ///
-/// Embeds the normalize_tone prompt content and references zhtw-mcp tools
-/// so Claude Code automatically enforces zh-TW conventions.
+/// Recommends the local CLI first and the MCP tool second, which is the
+/// opposite of what this function used to say. An agent that lints on every
+/// Chinese write pays for a verdict on its own TODO list, its plan and its
+/// handoff notes, none of which anybody reads;
+/// scripts/measure-agent-workflow.py
+/// puts a number on it. The MCP tool is unchanged and stays here for a session
+/// that has the server mounted and no shell.
 pub fn claude_code_section() -> String {
     r#"## zh-TW Writing Standards (zhtw-mcp)
 
-Use `zhtw` to lint/fix/gate Traditional Chinese (Taiwan) text per MoE standards.
-Read `zh-tw://style-guide/moe` resource for full conventions.
+Traditional Chinese (Taiwan) text is held to MoE standards. Read the
+`zh-tw://style-guide/moe` resource for the full conventions.
 
 ### Quick Reference
 
@@ -22,7 +27,27 @@ Read `zh-tw://style-guide/moe` resource for full conventions.
 - Punctuation: full-width ，。：；！？ in CJK prose; 「」 quotes, 『』 nested
 - Profiles: `base` (default) | `strict` (char variants). Flags: `relaxed` (UI strings), `detect_ai` (AI writing review)
 
-### Quality Gate
+### Finalizing (preferred)
+
+Run the linter once, on the document being delivered:
+
+```sh
+zhtw-mcp lint <file> --fix --format agent
+```
+
+It applies the deterministic corrections, rescans, and prints `PASS` or one
+line per remaining finding. An `AMBIG` line is a judgment call: pick the
+candidate the sentence supports and edit it by hand.
+
+Do not run it on working documents. Plans, TODO lists, analyses, debug notes,
+handoffs and intermediate drafts are Chinese nobody will read as a deliverable,
+and checking them costs a tool call each. The `zhtw-finalize` skill carries this
+policy in full.
+
+### The MCP tool
+
+`zhtw` is the same scanner over MCP, for a session with the server mounted and
+no shell:
 
 ```
 zhtw({ "text": "...", "fix_mode": "lexical_safe", "max_errors": 0, "output": "compact" })
@@ -178,27 +203,51 @@ pub const ALL_HOSTS: &[Host] = &[
 ];
 
 /// Generate Codex CLI integration instructions.
+///
+/// Leads with the CLI for the same reason the Claude Code section does: Codex
+/// has a shell, so a mounted server buys nothing but a schema in every request
+/// and a tool call per Chinese write. The registration stays documented below
+/// it, unchanged, because a Codex configuration that already has it should not
+/// have to undo anything.
 pub fn codex_instructions() -> String {
     r#"# Codex integration for zhtw-mcp
 
-Register the MCP server under the short name `zhtw` so tool calls appear as
-`mcp__zhtw.zhtw`:
+## Preferred: the local CLI at the delivery boundary
+
+Install the binary and add this guidance to `AGENTS.md`:
+
+```markdown
+Before delivering Traditional Chinese (Taiwan) text a person will read, run:
+
+    zhtw-mcp lint <file> --fix --format agent
+
+It applies the deterministic corrections, rescans, and prints `PASS` or one
+line per remaining finding. An `AMBIG` line is a judgment call the linter
+cannot settle from the finding alone: pick the candidate the sentence supports
+and edit it by hand, then run the command once more.
+
+Run it on deliverables only. Plans, TODO lists, analyses, research and debug
+notes, handoff summaries and intermediate drafts are Chinese written to work
+with, not to hand over, and linting them costs a call each for a verdict
+nobody reads. Add `--content-type markdown` for Markdown, `--relaxed` for UI
+strings, `--profile strict` for MoE character variants.
+```
+
+## Alternative: register the MCP server
+
+For a Codex configuration that prefers structured tool calls, register the
+server under the short name `zhtw` so calls appear as `mcp__zhtw.zhtw`:
 
 ```bash
 codex mcp add zhtw -- /path/to/zhtw-mcp
 ```
 
 Replace `/path/to/zhtw-mcp` with the installed binary path, for example
-`/Users/you/.local/bin/zhtw-mcp`.
+`/Users/you/.local/bin/zhtw-mcp`. The tool takes the same arguments it always
+did; prefer `fix_mode: "lexical_safe"` and `content_type: "markdown"`.
 
-Add this guidance to `AGENTS.md`:
-
-```markdown
-When editing Traditional Chinese (Taiwan) text, use the `zhtw` MCP tool to
-lint/fix/gate output against Taiwan MoE conventions. Prefer
-`fix_mode: "lexical_safe"` for deterministic corrections and use
-`content_type: "markdown"` for Markdown files.
-```
+Registering it costs the tool schema in every request for the whole session,
+which is why it is the second option here and not the first.
 
 After installing or rebuilding zhtw-mcp, restart Codex so it launches the new
 binary. Run `codex mcp get zhtw` to confirm the configured command."#

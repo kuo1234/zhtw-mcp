@@ -249,12 +249,39 @@ Other MCP clients may use `.mcp.json` in your project root:
 
 Replace `/path/to/zhtw-mcp` with the actual binary path (e.g., `target/release/zhtw-mcp`).
 
+### Coding agents: the CLI, not the server
+
+Claude Code and Codex have a shell, and for them the local CLI is the cheaper
+front end:
+
+```bash
+zhtw-mcp lint <file> --fix --format agent
+```
+
+That applies the deterministic corrections, rescans the file it just wrote, and
+prints `PASS` or one line per remaining finding. An `AMBIG` line is a judgment
+call the linter cannot settle on its own, listed with every candidate, for
+whoever is holding the document.
+
+The saving is not the size of one response. A mounted MCP server puts its tool
+schema in every request for the whole session, and an agent that treats "this
+is Chinese" as the cue to lint runs it over its own TODO list, its plan, its
+analysis notes and its handoff summary, none of which anybody reads. The
+[zhtw-finalize skill](.claude/skills/zhtw-finalize/SKILL.md) moves the check to
+the delivery boundary and says, at length, which documents are not one.
+`scripts/measure-agent-workflow.py` measures the two over the same session.
+
+The MCP server is not going anywhere. It remains the right front end for a host
+with no shell, for structured and IDE integrations, and for Sampling, which has
+no CLI equivalent.
+
 ### CLI quick start
 
 ```bash
 zhtw-mcp lint README.md                 # lint a file
 zhtw-mcp lint file.md --fix             # auto-fix in place
 zhtw-mcp lint file.md --fix --dry-run   # preview fixes
+zhtw-mcp lint file.md --format agent    # smallest report an agent can act on
 zhtw-mcp lint file.md --telemetry       # print stderr summary counters
 zhtw-mcp cache clear                    # clear persistent judgment cache
 ```

@@ -2,6 +2,28 @@
 
 The server exposes 1 tool, 2 resources, and 3 prompts over JSON-RPC 2.0 (stdio transport), plus MCP Sampling for server-initiated LLM disambiguation.
 
+## When the server is the right front end
+
+Mount it when the host has no shell, when the integration is structured (an IDE
+extension, a service, anything that wants a typed schema and a JSON result), or
+when you want Sampling: Tier 3 disambiguation runs through the client's model
+and has no CLI equivalent.
+
+For Claude Code and Codex, which do have a shell, the
+[zhtw-finalize skill](../.claude/skills/zhtw-finalize/SKILL.md) and
+`zhtw-mcp lint --fix --format agent` are the cheaper path, and the reason is
+not the size of a single response. A mounted server puts its tool schema in
+every request for the whole session, and an agent that treats "this is Chinese"
+as the cue to lint calls it on its own TODO list, its plan, its analysis notes
+and its handoff summary, none of which anybody reads. The skill moves the check
+to the delivery boundary, where one call answers for the one document that
+matters. `scripts/measure-agent-workflow.py` measures both over the same
+session.
+
+Nothing here is removed or deprecated by that. The tool, its schema, its
+arguments and its output modes are unchanged, and a host that has the server
+registered keeps working exactly as before.
+
 ## Protocol versions
 
 `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05`.

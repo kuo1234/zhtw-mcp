@@ -194,7 +194,12 @@ python3 scripts/check-ruleset.py --verify        # Wikipedia and MoE dict lookup
 sh extension/build-wasm.sh                       # needs wasm-pack
 npm test --prefix extension                      # extension helpers
 python3 scripts/measure-tokens.py                # telemetry calibration
+python3 scripts/measure-agent-workflow.py        # MCP against the finalize skill
 ```
+
+Both measurement scripts need `tiktoken`, and the workflow one takes
+`ZHTW_MCP_BIN` to measure a binary you already built rather than rebuilding
+through `cargo run --release` on every invocation.
 
 CI runs the extension build and its tests, but only on a push to `main`, on a
 pull request, or on a manual dispatch: a push to a topic branch runs nothing.
