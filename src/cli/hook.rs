@@ -103,7 +103,23 @@ fn callback_inner(payload_json: &str, cache_path: &Path) -> Option<String> {
         .and_then(|c| c.translation_memory.as_ref().map(PathBuf::from))
         .unwrap_or_else(|| zhtw_mcp::rules::store::discover_tm_path(anchor));
 
-    let fingerprint = rules_fingerprint(&overrides_path, config_path.as_deref(), &tm_path);
+    // The packs the scan will merge, by file, so installing or editing one
+    // moves the digest. A pack decides findings now, so a cached verdict that
+    // ignored it would answer for a rule set that has since changed.
+    let packs_dir = zhtw_mcp::rules::store::default_packs_dir();
+    let pack_paths: Vec<PathBuf> = project_cfg
+        .as_ref()
+        .and_then(|c| c.packs.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|name| packs_dir.join(format!("{name}.json")))
+        .collect();
+    let fingerprint = rules_fingerprint(
+        &overrides_path,
+        config_path.as_deref(),
+        &tm_path,
+        &pack_paths,
+    );
 
     let cache = HookCache::open(cache_path);
     let previous = cache.lookup(&payload.file_path);
@@ -233,9 +249,11 @@ fn read_lintable(path: &str) -> Option<String> {
 /// the translation memory and `ignore_terms` applied on top.  Skipping any of
 /// those layers would have the hook re-reporting what `zhtw-mcp lint`
 /// deliberately keeps quiet, which is the nagging this hook exists to remove.
-/// Packs are per-invocation opt-in and a hook has no flag context, so none are
-/// active.  A `None` store or a `None` config degrades to the embedded rules
-/// and the base profile: a broken config file should not switch the hook off.
+/// The active packs are the ones the project config names, which are the only
+/// packs a hook can know about since it has no flag context; their files are
+/// part of the cache fingerprint, so editing a pack re-scans.  A `None` store
+/// or a `None` config degrades to the embedded rules and the base profile: a
+/// broken config file should not switch the hook off.
 ///
 /// Info-severity issues are dropped from the result.  TM, glossary and
 /// `ignore_terms` suppression all express themselves by downgrading to Info,
@@ -552,11 +570,17 @@ impl HookCache {
 /// identical binary invalidates for nothing, costing one re-scan per file;
 /// a swapped binary with identical mtime and size is not a case that
 /// happens outside of construction.
-fn rules_fingerprint(overrides_path: &Path, config_path: Option<&Path>, tm_path: &Path) -> String {
+fn rules_fingerprint(
+    overrides_path: &Path,
+    config_path: Option<&Path>,
+    tm_path: &Path,
+    pack_paths: &[PathBuf],
+) -> String {
     let mut hasher = blake3::Hasher::new();
     for path in [Some(overrides_path), config_path, Some(tm_path)]
         .into_iter()
         .flatten()
+        .chain(pack_paths.iter().map(|p| p.as_path()))
     {
         if let Ok(bytes) = std::fs::read(path) {
             hasher.update(&bytes);

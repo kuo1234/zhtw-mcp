@@ -361,3 +361,26 @@ fn hook_honors_project_content_type_over_file_extension() {
         "project content_type = plain must override the .md extension"
     );
 }
+
+#[test]
+fn the_fingerprint_moves_when_a_configured_pack_changes() {
+    // The hook now merges the packs the project config names, so a pack is part
+    // of what decides the verdict and has to be part of what decides whether a
+    // cached verdict still stands. Before packs were active the fingerprint
+    // could ignore them; now it cannot.
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = dir.path().join("overrides.json");
+    let tm = dir.path().join("tm.json");
+    let pack = dir.path().join("probe.json");
+    std::fs::write(&pack, r#"{"schema_version":3,"spelling":[]}"#).unwrap();
+
+    let before = rules_fingerprint(&overrides, None, &tm, std::slice::from_ref(&pack));
+    std::fs::write(&pack, r#"{"schema_version":3,"spelling":[{"from":"x"}]}"#).unwrap();
+    let after = rules_fingerprint(&overrides, None, &tm, std::slice::from_ref(&pack));
+    assert_ne!(before, after, "editing a configured pack must re-scan");
+
+    // A pack the config does not name changes nothing.
+    let unrelated = rules_fingerprint(&overrides, None, &tm, &[]);
+    assert_ne!(unrelated, after);
+    assert_eq!(unrelated, rules_fingerprint(&overrides, None, &tm, &[]));
+}
