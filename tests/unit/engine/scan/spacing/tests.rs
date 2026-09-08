@@ -1,19 +1,19 @@
 use super::super::Scanner;
+use crate::engine::excluded::ByteRange;
+use crate::fixer::{apply_fixes, FixMode};
 use crate::rules::ruleset::IssueType;
+use crate::rules::ruleset::{Profile, SpacingPolicy};
 
 fn spacing_issues(text: &str) -> Vec<(String, String)> {
-    let scanner = Scanner::new(vec![], vec![]);
-    let issues = scanner.scan(text).issues;
-    issues
+    spacing_issues_with_policy(text, SpacingPolicy::Require)
         .into_iter()
         .filter(|i| {
-            i.rule_type == IssueType::Punctuation
-                && i.context.as_deref().is_some_and(|c| {
-                    c.contains("空格")
-                        || c.contains("標點")
-                        || c.contains("數字應使用")
-                        || c.contains("不重複")
-                })
+            i.context.as_deref().is_some_and(|c| {
+                c.contains("空格")
+                    || c.contains("標點")
+                    || c.contains("數字應使用")
+                    || c.contains("不重複")
+            })
         })
         .map(|i| {
             (
@@ -22,6 +22,58 @@ fn spacing_issues(text: &str) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+fn spacing_issues_with_policy(
+    text: &str,
+    policy: SpacingPolicy,
+) -> Vec<crate::rules::ruleset::Issue> {
+    spacing_issues_excluding(text, policy, &[])
+}
+
+fn spacing_issues_excluding(
+    text: &str,
+    policy: SpacingPolicy,
+    excluded: &[ByteRange],
+) -> Vec<crate::rules::ruleset::Issue> {
+    let scanner = Scanner::new(vec![], vec![]);
+    scanner
+        .scan_with_config(
+            text,
+            excluded,
+            Profile::Base.config().with_spacing_policy(policy),
+        )
+        .issues
+        .into_iter()
+        .filter(|issue| issue.rule_type == IssueType::Punctuation)
+        .collect()
+}
+
+/// The issues carrying one of the named contexts, matched whole.
+///
+/// Whole rather than by substring because the contexts overlap: rule 3 also
+/// ends its removal message in 不加空格, so a test for the boundary policy
+/// that filtered on that phrase would count rule 3's findings as its own.
+fn issues_with_context<'a>(
+    issues: &'a [crate::rules::ruleset::Issue],
+    contexts: &[&str],
+) -> Vec<&'a crate::rules::ruleset::Issue> {
+    issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .context
+                .as_deref()
+                .is_some_and(|c| contexts.contains(&c))
+        })
+        .collect()
+}
+
+/// The contexts the boundary policy itself emits under Strip.
+fn boundary_strip_issues(
+    issues: &[crate::rules::ruleset::Issue],
+) -> Vec<&crate::rules::ruleset::Issue> {
+    issues_with_context(issues, &["中英文之間不加空格", "中文與數字之間不加空格"])
 }
 
 #[test]
@@ -57,6 +109,127 @@ fn cjk_digit_has_space() {
     assert!(
         !issues.iter().any(|(c, _)| c.contains("數字")),
         "should not flag when space exists: {issues:?}"
+    );
+}
+
+#[test]
+fn strip_removes_only_cjk_boundary_spaces() {
+    let issues = spacing_issues_with_policy("在 LeanCloud 上，有 42 項", SpacingPolicy::Strip);
+    let stripped = boundary_strip_issues(&issues);
+    assert_eq!(stripped.len(), 4, "strip issues: {issues:?}");
+    assert!(stripped
+        .iter()
+        .all(|issue| issue.suggestions.first().is_some_and(String::is_empty)));
+}
+
+#[test]
+fn strip_leaves_adjacent_boundaries_and_other_spacing_rules_unchanged() {
+    let issues = spacing_issues_with_policy("在LeanCloud上， Test", SpacingPolicy::Strip);
+    assert!(
+        !issues.iter().any(|issue| issue
+            .context
+            .as_deref()
+            .is_some_and(|c| c.contains("中英文") || c.contains("中文與數字"))),
+        "adjacent boundaries must be accepted by strip: {issues:?}"
+    );
+    assert!(
+        issues.iter().any(|issue| issue
+            .context
+            .as_deref()
+            .is_some_and(|c| c.contains("全形標點"))),
+        "rule 3 must remain active in strip mode: {issues:?}"
+    );
+}
+
+#[test]
+fn require_then_strip_round_trips_boundary_fixture() {
+    let original = "在LeanCloud上有42項";
+    let required = spacing_issues_with_policy(original, SpacingPolicy::Require);
+    let spaced = apply_fixes(original, &required, FixMode::Orthographic, &[]).text;
+
+    // Asserted rather than implied: without this the round trip also passes
+    // when Require stops emitting and both fixes are no-ops.
+    assert_eq!(spaced, "在 LeanCloud 上有 42 項");
+    let stripped = spacing_issues_with_policy(&spaced, SpacingPolicy::Strip);
+    let restored = apply_fixes(&spaced, &stripped, FixMode::Orthographic, &[]).text;
+    assert_eq!(restored, original);
+}
+
+#[test]
+fn strip_removes_a_whole_space_run_at_one_boundary() {
+    // The only place the new span arithmetic can go wrong: the issue has to
+    // cover the run, not just the first space.
+    for (text, fixed) in [("中  A", "中A"), ("中   1", "中1")] {
+        let issues = spacing_issues_with_policy(text, SpacingPolicy::Strip);
+        let stripped = boundary_strip_issues(&issues);
+        assert_eq!(stripped.len(), 1, "{text}: {issues:?}");
+        assert_eq!(
+            apply_fixes(text, &issues, FixMode::Orthographic, &[]).text,
+            fixed
+        );
+    }
+}
+
+#[test]
+fn strip_governs_u0020_only() {
+    // Require inserts U+0020 and rule 3 removes U+0020, so Strip owns the same
+    // character and nothing else. A tab or a newline is layout, and U+00A0 or
+    // U+3000 is typography the author chose.
+    for gap in ['\u{00a0}', '\u{3000}', '\t', '\n'] {
+        let text = format!("中{gap}A");
+        let issues = spacing_issues_with_policy(&text, SpacingPolicy::Strip);
+        assert!(
+            boundary_strip_issues(&issues).is_empty(),
+            "{:?} is not a stored boundary space: {issues:?}",
+            gap
+        );
+    }
+}
+
+#[test]
+fn strip_leaves_rules_four_and_five_alone() {
+    // Rules 4 and 5 are not boundary policy, so both modes have to agree on
+    // them character for character.
+    for text in ["好啊！！！", "第３版", "在LeanCloud上！！！"] {
+        let under = |policy| {
+            let issues = spacing_issues_with_policy(text, policy);
+            issues_with_context(&issues, &["不重複使用標點符號", "數字應使用半形字元"])
+                .into_iter()
+                .map(|issue| (issue.offset, issue.found.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            under(SpacingPolicy::Require),
+            under(SpacingPolicy::Strip),
+            "{text}: rules 4 and 5 must not read the boundary policy"
+        );
+    }
+}
+
+#[test]
+fn strip_keeps_rule_three_when_the_text_after_the_space_is_excluded() {
+    // The strip lookahead runs before rule 3 at the same character. When it
+    // lands on an excluded range it has nothing to report, and used to return
+    // from the whole check, taking rule 3 with it.
+    let text = "參考： https://example.com/a";
+    let url_start = text.find("https").unwrap();
+    let excluded = [ByteRange {
+        start: url_start,
+        end: text.len(),
+    }];
+    let rule_three = |policy| {
+        let issues = spacing_issues_excluding(text, policy, &excluded);
+        issues_with_context(&issues, &["全形標點與其他字元之間不加空格"])
+            .into_iter()
+            .map(|issue| (issue.offset, issue.length))
+            .collect::<Vec<_>>()
+    };
+    let require = rule_three(SpacingPolicy::Require);
+    assert_eq!(require.len(), 1, "rule 3 should fire under require");
+    assert_eq!(
+        rule_three(SpacingPolicy::Strip),
+        require,
+        "rule 3 must not depend on the boundary policy"
     );
 }
 

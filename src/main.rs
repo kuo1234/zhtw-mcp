@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 mod cli;
 
-use cli::args::{help_text, parse_args, Cli, Command, LintArgs};
+use cli::args::{help_text, parse_args, Cli, Command, LintArgs, TmArgs};
 use cli::lint::{content_type_for, run_lint_batch, LintBatchParams};
 
 /// Text failed a gate: too many errors or warnings.  The input was linted
@@ -110,15 +110,7 @@ fn run(cli: Cli) -> Result<()> {
                 .as_ref()
                 .and_then(|c| c.translation_memory.as_ref().map(PathBuf::from))
                 .unwrap_or_else(|| zhtw_mcp::rules::store::discover_tm_path(&cwd));
-            run_tm_cmd(
-                &tm.cmd,
-                tm.arg.as_deref(),
-                &tm_path,
-                tm.found.as_deref(),
-                tm.suggested.as_deref(),
-                tm.chose.as_deref(),
-                tm.context.as_deref(),
-            )
+            run_tm_cmd(&tm, &tm_path)
         }
 
         // Pack subcommand: manage rule packs.
@@ -205,6 +197,7 @@ fn run_lint(
         .profile
         .as_deref()
         .or_else(|| cfg_ref.and_then(|c| c.profile.as_deref()));
+    let eff_spacing = lint.spacing.or_else(|| cfg_ref.and_then(|c| c.spacing));
     // CLI --relaxed flag overrides config file relaxed setting.
     let eff_relaxed = lint.relaxed || cfg_ref.and_then(|c| c.relaxed).unwrap_or(false);
     // Family subtractions compose across the command line and project config.
@@ -266,6 +259,7 @@ fn run_lint(
         max_errors: eff_max_errors,
         max_warnings: eff_max_warnings,
         profile_name: eff_profile,
+        spacing: eff_spacing,
         off: &eff_off,
         content_type_override: eff_content_type,
         overrides_path: &eff_overrides,
@@ -578,18 +572,15 @@ fn run_translation_guide() -> Result<()> {
 
 // Pack subcommand
 
-fn run_tm_cmd(
-    cmd: &str,
-    arg: Option<&str>,
-    tm_path: &std::path::Path,
-    record_found: Option<&str>,
-    record_suggested: Option<&str>,
-    record_chose: Option<&str>,
-    record_context: Option<&str>,
-) -> Result<()> {
+/// The four record fields travel together and arrive parsed into one struct,
+/// so the subcommand reads them from it rather than taking each as its own
+/// parameter.  Spelled out positionally this sat at seven arguments, the point
+/// where the next field forces the refactor anyway.
+fn run_tm_cmd(tm: &TmArgs, tm_path: &std::path::Path) -> Result<()> {
     use zhtw_mcp::rules::store::{iso_date_today, TmEntry, TranslationMemoryStore};
 
-    match cmd {
+    let arg = tm.arg.as_deref();
+    match tm.cmd.as_str() {
         "list" => {
             let store = TranslationMemoryStore::open(tm_path)?;
             let entries = store.list();
@@ -625,16 +616,19 @@ fn run_tm_cmd(
             Ok(())
         }
         "record" => {
-            let found = record_found.context("tm record requires --found")?;
-            let suggested = record_suggested.context("tm record requires --suggested")?;
-            let chose = record_chose.context("tm record requires --chose")?;
+            let found = tm.found.as_deref().context("tm record requires --found")?;
+            let suggested = tm
+                .suggested
+                .as_deref()
+                .context("tm record requires --suggested")?;
+            let chose = tm.chose.as_deref().context("tm record requires --chose")?;
 
             let mut store = TranslationMemoryStore::open(tm_path)?;
             store.record(TmEntry {
                 found: found.to_string(),
                 scanner_suggested: suggested.to_string(),
                 user_chose: chose.to_string(),
-                context: record_context.map(String::from),
+                context: tm.context.clone(),
                 timestamp: iso_date_today(),
             })?;
             eprintln!("Recorded: '{found}' -> chose '{chose}'");
@@ -642,7 +636,8 @@ fn run_tm_cmd(
         }
         _ => {
             anyhow::bail!(
-                "unknown tm subcommand: '{cmd}' (expected list|export|import|clear|record)"
+                "unknown tm subcommand: '{}' (expected list|export|import|clear|record)",
+                tm.cmd
             );
         }
     }

@@ -54,6 +54,7 @@ Options:
   --dry-run                 Preview fixes without writing
   --explain                 Attach cultural/linguistic annotations
   --profile <p>             Rule profile: base or strict
+  --spacing <policy>        CJK boundary spaces: require (default) or strip
   --off <family>            Disable a rule family (repeatable): spelling,
                             casing, punctuation, quotes, spacing, colon,
                             dunhao, range, variant, ellipsis, grammar, ai,
@@ -104,6 +105,7 @@ zhtw-mcp lint -- < input.txt
 
 # With options
 zhtw-mcp lint file.md --format json --profile strict --max-errors 5
+zhtw-mcp lint file.md --spacing strip  # HTML renderer supplies the gap
 zhtw-mcp lint file.md --off punctuation --off variant
 # Families are independent: --off punctuation keeps full-width colon
 # enforcement, --off spelling keeps variant, ai and translationese, and
@@ -392,13 +394,16 @@ Create `.zhtw-mcp.toml` at your project root for team-wide settings:
 
 ```toml
 profile = "strict"
+spacing = "strip"
 max_errors = 0
 max_warnings = 10
 exclude = ["vendor/**", "*.bak"]
 packs = ["medical"]
 ```
 
-Discovered by walking from cwd upward to the `.git` root. CLI flags override config values. `off`, `exclude` and `packs` merge their lists from both sources; all other CLI values override config values. A malformed or misspelled config is an error rather than a silent fallback to defaults: an unknown top-level field, or an unknown `off` family, exits 2 and names the file. Supported fields: `profile`, `relaxed`, `off`, `content_type`, `max_errors`, `max_warnings`, `ignore_terms`, `exclude`, `overrides`, `suppressions`, `packs`, `translation_memory`, plus the `[markdown]` and `[glossary]` sections. `off` accepts `spelling`, `casing`, `punctuation`, `quotes`, `spacing`, `colon`, `dunhao`, `range`, `variant`, `ellipsis`, `grammar`, `ai`, `translationese`, and `rhythm`.
+Discovered by walking from cwd upward to the `.git` root. CLI flags override config values. `off`, `exclude` and `packs` merge their lists from both sources; all other CLI values override config values. A malformed or misspelled config is an error rather than a silent fallback to defaults: an unknown top-level field, an unknown `off` family, or a `spacing` value other than `require` or `strip`, exits 2 and names the file. Supported fields: `profile`, `spacing`, `relaxed`, `off`, `content_type`, `max_errors`, `max_warnings`, `ignore_terms`, `exclude`, `overrides`, `suppressions`, `packs`, `translation_memory`, plus the `[markdown]` and `[glossary]` sections. `off` accepts `spelling`, `casing`, `punctuation`, `quotes`, `spacing`, `colon`, `dunhao`, `range`, `variant`, `ellipsis`, `grammar`, `ai`, `translationese`, and `rhythm`.
+
+`spacing = "require"` is the default and stores spaces at CJK/Latin and CJK/digit boundaries; `spacing = "strip"` removes them, for projects that control their own HTML rendering. Both policies leave the other spacing checks alone. See [docs/rules.md](rules.md#cjk-boundary-spacing-policy) for which characters the policy governs and why the default is what it is.
 
 A family switch subtracts from what the scanner enforces on its own, not from what the project has explicitly asked for: a term listed under `[glossary] banned` still fires with `--off spelling`, because that list names terms this project bans rather than a rule family the profile turned on. `ignore_terms` keeps matching issues in the output but drops them to `info`, so they count against neither `max_errors` nor `max_warnings`. `overrides`, `suppressions` and `translation_memory` name the store files; all three are also read in server mode, so an MCP client needs no flags and the server answers from the same stores `lint` reads. `off` is not read in server mode: it applies to `lint`, and an MCP client asks for the same subtraction through the tool's own `off` argument.
 

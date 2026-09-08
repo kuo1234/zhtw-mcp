@@ -532,6 +532,95 @@ fn count_zero_width(text: &str, excluded: &[ByteRange]) -> usize {
     count
 }
 
+/// Signal 1: how far each tracked phrase runs above its density threshold.
+///
+/// Returns the weighted excess and the total weight considered, and pushes one
+/// marker per phrase that occurs at all, whether or not it is over threshold:
+/// the report lists what was measured, not only what scored.
+fn phrase_density_signal(
+    text: &str,
+    excluded: &[ByteRange],
+    mentions: &[ByteRange],
+    text_k: f32,
+    threshold_multiplier: f32,
+    markers: &mut Vec<AiMarker>,
+) -> (f32, f32) {
+    let mut weighted_sum: f32 = 0.0;
+    let mut total_weight: f32 = 0.0;
+
+    // Apply threshold_multiplier so low/high sensitivity affects the composite
+    // score, not just per-issue generation.
+    for &(phrase, baseline, raw_threshold, weight) in DENSITY_SIGNALS {
+        let threshold = raw_threshold * threshold_multiplier;
+        let phrase_len = phrase.len();
+        let mut count: usize = 0;
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(phrase) {
+            let abs = start + pos;
+            start = abs + phrase_len;
+
+            // "mentions" is separate from "excluded" on purpose. A quoted
+            // phrase is not being used, so it must not score; but the
+            // invisible-character signal counts through "excluded", and
+            // widening that would let a hidden payload inside 「…」 go
+            // uncounted, which is the channel this layer exists to close.
+            if !is_excluded(abs, abs + phrase_len, excluded)
+                && !is_excluded(abs, abs + phrase_len, mentions)
+            {
+                count += 1;
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        let density = count as f32 / text_k;
+        markers.push(AiMarker {
+            pattern: phrase.to_string(),
+            count,
+            density,
+            threshold,
+            expected_baseline: baseline,
+        });
+        if density > threshold {
+            // Normalized contribution: how far above threshold, capped at 1.0.
+            let excess = ((density - threshold) / threshold).min(2.0);
+            weighted_sum += excess * weight;
+        }
+        total_weight += weight;
+    }
+    (weighted_sum, total_weight)
+}
+
+/// Signal 6: uniform punctuation rhythm, as an aggregate coefficient of
+/// variation across the punctuation types with enough samples to mean
+/// anything.  Low variation reads as machine cadence.  Caps at 0.1.
+fn punctuation_contribution(profile: &PunctuationProfile, threshold_multiplier: f32) -> f32 {
+    // Aggregate CV across types with sufficient samples (N >= 10), weighted by
+    // occurrence count.
+    let stats = [
+        &profile.comma,
+        &profile.period,
+        &profile.semicolon,
+        &profile.dunhao,
+        &profile.dash,
+    ];
+    let mut weighted_cv_sum = 0.0f64;
+    let mut total_count = 0usize;
+    for stat in &stats {
+        if let Some(cv) = stat.cv {
+            weighted_cv_sum += cv as f64 * stat.count as f64;
+            total_count += stat.count;
+        }
+    }
+    if total_count == 0 {
+        return 0.0;
+    }
+    let aggregate_cv = (weighted_cv_sum / total_count as f64) as f32;
+    // Low CV (< threshold) = uniform rhythm = AI signal.  Max 0.1.
+    let cv_threshold = 0.5 * threshold_multiplier;
+    ((cv_threshold - aggregate_cv).max(0.0) / cv_threshold * 0.1).min(0.1)
+}
+
 /// Compute AI signature report from text and post-scan issues.
 ///
 /// Combines five signal sources:
@@ -578,49 +667,16 @@ pub fn compute_ai_score(
     let text_k = char_count as f32 / 1000.0;
 
     let mut markers = Vec::new();
-    let mut weighted_sum: f32 = 0.0;
-    let mut total_weight: f32 = 0.0;
 
-    // Signal 1: phrase density. Apply threshold_multiplier so low/high
-    // sensitivity affects the composite score, not just per-issue generation.
-    for &(phrase, baseline, raw_threshold, weight) in DENSITY_SIGNALS {
-        let threshold = raw_threshold * threshold_multiplier;
-        let phrase_len = phrase.len();
-        let mut count: usize = 0;
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(phrase) {
-            let abs = start + pos;
-            start = abs + phrase_len;
-
-            // "mentions" is separate from "excluded" on purpose. A quoted
-            // phrase is not being used, so it must not score; but the
-            // invisible-character signal below counts through "excluded", and
-            // widening that would let a hidden payload inside 「…」 go
-            // uncounted, which is the channel this layer exists to close.
-            if !is_excluded(abs, abs + phrase_len, excluded)
-                && !is_excluded(abs, abs + phrase_len, mentions)
-            {
-                count += 1;
-            }
-        }
-        if count == 0 {
-            continue;
-        }
-        let density = count as f32 / text_k;
-        markers.push(AiMarker {
-            pattern: phrase.to_string(),
-            count,
-            density,
-            threshold,
-            expected_baseline: baseline,
-        });
-        if density > threshold {
-            // Normalized contribution: how far above threshold, capped at 1.0.
-            let excess = ((density - threshold) / threshold).min(2.0);
-            weighted_sum += excess * weight;
-        }
-        total_weight += weight;
-    }
+    // Signal 1: phrase density.
+    let (weighted_sum, total_weight) = phrase_density_signal(
+        text,
+        excluded,
+        mentions,
+        text_k,
+        threshold_multiplier,
+        &mut markers,
+    );
 
     // Signal 2: how many distinct structural families fired.
     //
@@ -702,33 +758,7 @@ pub fn compute_ai_score(
 
     // Signal 6: punctuation density matrix, aggregate CV.
     let punctuation_profile = compute_punctuation_profile(text, text_k, excluded);
-    let punct_contribution = {
-        // Aggregate CV across types with sufficient samples (N >= 10), weighted
-        // by occurrence count.
-        let stats = [
-            &punctuation_profile.comma,
-            &punctuation_profile.period,
-            &punctuation_profile.semicolon,
-            &punctuation_profile.dunhao,
-            &punctuation_profile.dash,
-        ];
-        let mut weighted_cv_sum = 0.0f64;
-        let mut total_count = 0usize;
-        for stat in &stats {
-            if let Some(cv) = stat.cv {
-                weighted_cv_sum += cv as f64 * stat.count as f64;
-                total_count += stat.count;
-            }
-        }
-        if total_count > 0 {
-            let aggregate_cv = (weighted_cv_sum / total_count as f64) as f32;
-            // Low CV (< threshold) = uniform rhythm = AI signal.  Max 0.1.
-            let cv_threshold = 0.5 * threshold_multiplier;
-            ((cv_threshold - aggregate_cv).max(0.0) / cv_threshold * 0.1).min(0.1)
-        } else {
-            0.0
-        }
-    };
+    let punct_contribution = punctuation_contribution(&punctuation_profile, threshold_multiplier);
 
     // Composite score: combine all five scoring signals (rebalanced per 40.11).
     // phrase ≤0.7, structural ≤0.45 (prose ≤0.3 plus formatting ≤0.15, capped

@@ -50,6 +50,7 @@ fn discover_returns_none_when_absent() {
 fn parse_all_fields() {
     let toml = r#"
 profile = "strict"
+spacing = "strip"
 content_type = "markdown"
 max_errors = 0
 max_warnings = 10
@@ -62,6 +63,10 @@ off = ["punctuation", "variant"]
 "#;
     let cfg: ProjectConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.profile.as_deref(), Some("strict"));
+    assert_eq!(
+        cfg.spacing,
+        Some(crate::rules::ruleset::SpacingPolicy::Strip)
+    );
     assert_eq!(cfg.content_type.as_deref(), Some("markdown"));
     assert_eq!(cfg.max_errors, Some(0));
     assert_eq!(cfg.max_warnings, Some(10));
@@ -80,6 +85,7 @@ off = ["punctuation", "variant"]
 fn config_rejects_unknown_fields_and_families() {
     assert!(toml::from_str::<ProjectConfig>("oops = true").is_err());
     assert!(toml::from_str::<ProjectConfig>("off = [\"not-a-family\"]").is_err());
+    assert!(toml::from_str::<ProjectConfig>("spacing = \"off\"").is_err());
 }
 
 #[test]

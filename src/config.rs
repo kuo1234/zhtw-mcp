@@ -18,6 +18,7 @@ const CONFIG_FILENAME: &str = ".zhtw-mcp.toml";
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectConfig {
     pub profile: Option<String>,
+    pub spacing: Option<crate::rules::ruleset::SpacingPolicy>,
     pub relaxed: Option<bool>,
     pub content_type: Option<String>,
     pub max_errors: Option<usize>,

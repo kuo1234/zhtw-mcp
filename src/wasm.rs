@@ -7,7 +7,7 @@ use crate::engine::excluded::ByteRange;
 use crate::engine::html_lang::excludes;
 use crate::engine::scan::{ContentType, Scanner};
 use crate::rules::loader::load_embedded_ruleset;
-use crate::rules::ruleset::{Issue, Profile, RuleFamily, Severity};
+use crate::rules::ruleset::{Issue, Profile, RuleFamily, Severity, SpacingPolicy};
 
 static SCANNER: OnceLock<Scanner> = OnceLock::new();
 
@@ -20,6 +20,7 @@ pub fn start() {
 #[serde(default)]
 struct ScanOptions {
     profile: Option<String>,
+    spacing: Option<SpacingPolicy>,
     relaxed: bool,
     off: Vec<RuleFamily>,
     /// Runs of the text that carry a declared language, from the content
@@ -88,6 +89,9 @@ pub fn scan_text(text: &str, options_json: Option<String>) -> Result<String, JsV
     let mut config = profile.config();
     if options.relaxed {
         config = config.with_relaxed();
+    }
+    if let Some(policy) = options.spacing {
+        config = config.with_spacing_policy(policy);
     }
     config = config.with_disabled(&options.off);
 

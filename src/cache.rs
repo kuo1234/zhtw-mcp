@@ -66,6 +66,19 @@ struct FileMeta {
     size: u64,
 }
 
+/// The file a cache entry is stored for, and what the scan learned about its
+/// text.  Six values that only ever travel together, named at the call site
+/// rather than spelled positionally: `put("a.md", b"x", 1000, 5, .., false, 5)`
+/// gave two bare integers and a bare bool no reader could tell apart.
+pub struct CacheSubject<'a> {
+    pub file_path: &'a str,
+    pub content: &'a [u8],
+    pub mtime_secs: u64,
+    pub size: u64,
+    pub input_was_sc: bool,
+    pub text_char_count: usize,
+}
+
 /// Scan parameters that affect output (excluding file content).
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanParams {
@@ -278,18 +291,15 @@ impl ScanCache {
     }
 
     /// Store a scan result in the cache.
-    #[allow(clippy::too_many_arguments)]
-    pub fn put(
-        &mut self,
-        file_path: &str,
-        content: &[u8],
-        mtime_secs: u64,
-        size: u64,
-        params: &ScanParams,
-        output: ScanOutput,
-        input_was_sc: bool,
-        text_char_count: usize,
-    ) {
+    pub fn put(&mut self, subject: CacheSubject<'_>, params: &ScanParams, output: ScanOutput) {
+        let CacheSubject {
+            file_path,
+            content,
+            mtime_secs,
+            size,
+            input_was_sc,
+            text_char_count,
+        } = subject;
         if output.issues.len() > MAX_ENTRY_ISSUES {
             tracing::debug!(
                 "not caching {file_path}: {} issues exceeds {MAX_ENTRY_ISSUES}",

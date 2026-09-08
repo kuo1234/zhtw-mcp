@@ -839,6 +839,47 @@ pub struct Scanner {
     guards: rule_ir::GuardRules,
 }
 
+/// The two document-level signature reports, each `None` unless its own
+/// detection flags asked for it. They read the issues the passes just emitted,
+/// so they run after the lexical and structural work rather than beside it.
+fn document_signatures(
+    text: &str,
+    issues: &[Issue],
+    excluded: &[ByteRange],
+    mentions: &[ByteRange],
+    cfg: &ProfileConfig,
+) -> (
+    Option<crate::engine::ai_score::AiSignatureReport>,
+    Option<crate::engine::translationese_score::TranslationeseReport>,
+) {
+    // Compute AI signature score when any AI detection flag is active.
+    let ai_signature = if cfg.ai_detection_active() {
+        crate::engine::ai_score::compute_ai_score(
+            text,
+            issues,
+            excluded,
+            mentions,
+            cfg.ai_threshold_multiplier,
+        )
+    } else {
+        None
+    };
+
+    // Compute translationese signature when detection is active.
+    let translationese_signature = if cfg.translationese_detection {
+        crate::engine::translationese_score::compute_translationese_score_with_domain(
+            text,
+            issues,
+            excluded,
+            cfg.translationese_domain,
+        )
+    } else {
+        None
+    };
+
+    (ai_signature, translationese_signature)
+}
+
 impl Scanner {
     /// Read-only access to the spelling rules held by this scanner.
     pub fn spelling_rules(&self) -> &[SpellingRule] {
@@ -913,7 +954,7 @@ impl Scanner {
             self.scan_quotes(&mut em);
         }
         if cfg.spacing {
-            self.scan_spacing(&mut em);
+            self.scan_spacing(&mut em, cfg);
         }
         if cfg.ellipsis_normalization {
             scan_ellipsis(&mut em);
@@ -1366,7 +1407,7 @@ impl Scanner {
             self.scan_quotes(em);
         }
         if cfg.spacing {
-            self.scan_spacing(em);
+            self.scan_spacing(em, cfg);
         }
         // Repetition detection (CJK duplicates + Latin duplicates).
         repetition::scan_repetition(em);
@@ -1568,34 +1609,9 @@ impl Scanner {
             }
         }
 
-        // Compute AI signature score when any AI detection flag is active.
-        let ai_signature = if cfg.ai_filler_detection
-            || cfg.ai_semantic_safety
-            || cfg.ai_density_detection
-            || cfg.ai_structural_patterns
-        {
-            crate::engine::ai_score::compute_ai_score(
-                text,
-                issues,
-                excluded,
-                &mentions,
-                cfg.ai_threshold_multiplier,
-            )
-        } else {
-            None
-        };
-
-        // Compute translationese signature when detection is active.
-        let translationese_signature = if cfg.translationese_detection {
-            crate::engine::translationese_score::compute_translationese_score_with_domain(
-                text,
-                issues,
-                excluded,
-                cfg.translationese_domain,
-            )
-        } else {
-            None
-        };
+        // The two document-level signatures, each gated by its own flags.
+        let (ai_signature, translationese_signature) =
+            document_signatures(text, issues, excluded, &mentions, &cfg);
 
         let oral_density = compute_oral_density(text);
 
@@ -1998,11 +2014,7 @@ fn run_ai_filter(
     // counts them whenever any AI stage is on, so gating the findings on one
     // stage left a caller able to see a zero-width count with no issue to fix.
     // Same condition as the score.
-    if cfg.ai_filler_detection
-        || cfg.ai_semantic_safety
-        || cfg.ai_density_detection
-        || cfg.ai_structural_patterns
-    {
+    if cfg.ai_detection_active() {
         grammar::scan_ai_zero_width(em);
     }
 

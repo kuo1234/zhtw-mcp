@@ -52,6 +52,7 @@ Unified lint / fix / gate for zh-TW text.
 | `max_errors` | integer | Reject if residual errors exceed threshold |
 | `max_warnings` | integer | Reject if residual warnings exceed threshold |
 | `profile` | `"base"` / `"strict"` | Rule profile |
+| `spacing` | `"require"` / `"strip"` | CJK/Latin and CJK/digit boundary policy; `require` is the default |
 | `off` | array of rule-family names | Disable named families after profile and capability flags resolve |
 | `relaxed` | boolean | Relax colon and other UI-string-level rules |
 | `content_type` | `"plain"` / `"markdown"` / `"markdown-scan-code"` / `"yaml"` | Content type (`markdown-scan-code` also lints inside code blocks) |

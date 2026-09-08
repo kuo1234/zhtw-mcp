@@ -22,6 +22,8 @@ The generated files are written to `extension/dist/`.
 4. Open a page containing text such as `這個軟件使用了遞歸算法來遍歷鏈表`.
 5. Click the extension icon, then **檢查目前分頁**.
 
+The popup selects the profile, the CJK boundary spacing policy (the same choice `--spacing` makes on the CLI), the UI-string relaxation, and the rule families to turn off.
+
 The extension uses `activeTab`, so it scans only after a user gesture and only for the current active tab. Badge counts include warning and error issues; info-level findings appear in the popup but do not increase the badge.
 
 ## Test JavaScript helpers

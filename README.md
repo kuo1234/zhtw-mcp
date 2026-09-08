@@ -58,6 +58,7 @@ These standards are enforced through two profiles on the strictness axis, plus o
 |------|---------|
 | `relaxed` | Relaxed for software UI: disables colon/dunhao enforcement and grammar checks; uses en-dash for ranges |
 | `detect_ai` | AI writing review: filler phrase detection, semantic safety words, copula/passive voice checks, density-based pattern detection |
+| `spacing` | CJK boundary policy, `--spacing require\|strip`: `require` stores spaces (default); `strip` leaves the gap to a controlled HTML renderer. The one flag here that takes a value, and a different thing from `--off spacing`, which turns the whole family off |
 
 For unsupported authority attributions, select `document_genre` in MCP or
 `--document-genre casual|technical|financial` in the CLI. The check runs only
@@ -68,6 +69,8 @@ the source or drop the appeal; technical and financial prose are told the
 claim needs a citation.
 
 Profiles control how strict the zh-TW norm enforcement is. Flags are orthogonal -- `detect_ai` works with either profile, `relaxed` can combine with `strict` if you want variant normalization but lenient punctuation.
+
+`spacing=require` is the default because source text also appears outside CSS-capable renderers. Projects that control their HTML can select `strip` and use [`text-autospace`](https://developer.mozilla.org/en-US/docs/Web/CSS/text-autospace), a Baseline newly-available property since November 2025. [UTR #59](https://www.unicode.org/reports/tr59/) is a draft for layout-time autospacing, not a requirement to remove source-text spaces. Either way the policy governs the U+0020 space and only at CJK/Latin and CJK/digit boundaries.
 
 See [docs/rules.md](docs/rules.md) for the full rule reference.
 

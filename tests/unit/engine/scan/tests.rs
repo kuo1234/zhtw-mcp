@@ -2,6 +2,7 @@ use super::overlap::resolve_overlaps;
 use super::*;
 use crate::rules::ruleset::RuleFamily;
 use crate::rules::ruleset::RuleType;
+use crate::rules::ruleset::SpacingPolicy;
 
 fn sample_spelling_rules() -> Vec<SpellingRule> {
     vec![

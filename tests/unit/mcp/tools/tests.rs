@@ -1,3 +1,4 @@
+use super::schema::{input_schema_properties, tool_definitions};
 use super::*;
 use crate::rules::ruleset::{RuleFamily, Tier2Outcome};
 use rmcp::model::ErrorCode;
@@ -705,6 +706,7 @@ fn schema_documents_every_parameter_the_tool_takes() {
         "max_errors",
         "max_warnings",
         "profile",
+        "spacing",
         "off",
         "relaxed",
         "exempt_blockquotes",
@@ -914,6 +916,35 @@ fn tools_call_rhythm_is_opt_in() {
         .len();
     let on = assert_tool_success(&on)["issues"].as_array().unwrap().len();
     assert!(on > off, "rhythm should add advisories: {on} vs {off}");
+}
+
+#[test]
+fn tools_call_spacing_strip_removes_stored_boundary_spaces() {
+    let (mut server, _dir) = make_initialized_server();
+    let resp = call_zhtw(
+        &mut server,
+        serde_json::json!({ "text": "在 Hello", "spacing": "strip" }),
+    );
+    let output = assert_tool_success(&resp);
+    assert!(
+        output["issues"].as_array().unwrap().iter().any(|issue| {
+            issue["context"]
+                .as_str()
+                .is_some_and(|context| context.contains("中英文之間不加空格"))
+        }),
+        "strip policy should report the stored boundary space: {output}"
+    );
+}
+
+#[test]
+fn tools_call_rejects_an_unknown_spacing_policy() {
+    let (mut server, _dir) = make_initialized_server();
+    let err = assert_tool_error(call_zhtw(
+        &mut server,
+        serde_json::json!({ "text": "", "spacing": "off" }),
+    ));
+    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    assert_eq!(err.data.unwrap()["field"], "spacing");
 }
 
 #[test]

@@ -171,22 +171,64 @@ function optionValuesOf(html, selectId) {
   return [...block[1].matchAll(/value="([^"]+)"/g)].map((match) => match[1]);
 }
 
-test("the popup offers exactly the rule families the scanner accepts", () => {
-  const popupHtml = readFileSync(
-    fileURLToPath(new URL("../popup.html", import.meta.url)),
-    "utf8",
-  );
-  assert.deepEqual(
-    optionValuesOf(popupHtml, "off"),
-    ruleFamilyNames(rulesetSource),
-    "popup.html and RuleFamily disagree about the family names",
-  );
+/// The popup.html source, read once for every contract test below.
+const popupHtml = readFileSync(
+  fileURLToPath(new URL("../popup.html", import.meta.url)),
+  "utf8",
+);
 
-  assert.ok(
-    rustFieldsOf(wasmSource, "ScanOptions").includes("off"),
-    "ScanOptions no longer has an off field",
+/// The variant names of a Rust enum, lower cased.
+///
+/// ScanOptions deserializes SpacingPolicy under #[serde(rename_all =
+/// "snake_case")], and every variant is one word, so the wire spelling is the
+/// variant name in lower case.
+function enumVariantNames(source, enumName) {
+  const body = new RegExp(`enum ${quote(enumName)} \\{([\\s\\S]*?)\\n\\}`).exec(source);
+  assert.ok(body, `enum ${enumName} not found in src/rules/ruleset.rs`);
+  return [...body[1].matchAll(/^\s*([A-Z][A-Za-z]*),/gm)].map((match) =>
+    match[1].toLowerCase(),
   );
-  for (const file of ["popup.js", "background.js"]) {
-    assert.match(src(file), /off\s*:/, `${file} does not send off`);
-  }
-});
+}
+
+// Each select reaches the scanner through serde, which rejects an unknown
+// variant: a name renamed in Rust and not here fails the whole scan rather
+// than falling back to a default. Reading the Rust source is how this side
+// notices.
+const SELECT_CONTRACTS = [
+  {
+    select: "off",
+    field: "off",
+    names: () => ruleFamilyNames(rulesetSource),
+    senders: ["popup.js", "background.js"],
+    rustName: "RuleFamily",
+  },
+  {
+    select: "spacing",
+    field: "spacing",
+    names: () => enumVariantNames(rulesetSource, "SpacingPolicy"),
+    senders: ["popup.js", "background.js"],
+    rustName: "SpacingPolicy",
+  },
+];
+
+for (const { select, field, names, senders, rustName } of SELECT_CONTRACTS) {
+  test(`the popup offers exactly the ${select} values the scanner accepts`, () => {
+    assert.deepEqual(
+      optionValuesOf(popupHtml, select),
+      names(),
+      `popup.html and ${rustName} disagree about the names`,
+    );
+
+    assert.ok(
+      rustFieldsOf(wasmSource, "ScanOptions").includes(field),
+      `ScanOptions no longer has a ${field} field`,
+    );
+    for (const file of senders) {
+      assert.match(
+        src(file),
+        new RegExp(`${quote(field)}\\s*:`),
+        `${file} does not send ${field}`,
+      );
+    }
+  });
+}

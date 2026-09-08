@@ -198,6 +198,27 @@ impl RegisterMode {
     }
 }
 
+/// The project policy for spaces at CJK/Latin and CJK/digit boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpacingPolicy {
+    /// Store a U+0020 space at each boundary.
+    Require,
+    /// Store no U+0020 space and leave boundary spacing to the renderer.
+    Strip,
+}
+
+impl SpacingPolicy {
+    /// Strictly parse the names exposed by the CLI and MCP tool.
+    pub fn from_str_strict(s: &str) -> Option<Self> {
+        match s {
+            "require" => Some(Self::Require),
+            "strip" => Some(Self::Strip),
+            _ => None,
+        }
+    }
+}
+
 /// Processing chain configuration for a profile.
 ///
 /// Each profile is a combination of enabled rule stages rather than a
@@ -217,6 +238,8 @@ pub struct ProfileConfig {
     pub quotes: bool,
     /// Enable spacing between CJK, Latin letters, and digits.
     pub spacing: bool,
+    /// Whether CJK/Latin and CJK/digit boundaries require a space or strip it.
+    pub spacing_policy: SpacingPolicy,
     /// Enable full-width colon enforcement (: -> ：).
     pub colon_enforcement: bool,
     /// Enable enumeration comma (dunhao) detection.
@@ -282,6 +305,65 @@ pub struct ProfileConfig {
 }
 
 impl ProfileConfig {
+    /// Every pass off, the baseline a caller enables one axis at a time from.
+    ///
+    /// It lives beside the struct so that a new field reaches it, and through
+    /// it every caller that spreads it, with the pass off. A literal spelled
+    /// out field by field elsewhere goes stale instead, and the compiler
+    /// reports that only where it is written.
+    pub fn all_disabled() -> Self {
+        Self {
+            document_genre: AttributionGenre::Casual,
+            spelling: false,
+            casing: false,
+            punctuation: false,
+            quotes: false,
+            spacing: false,
+            spacing_policy: SpacingPolicy::Require,
+            colon_enforcement: false,
+            dunhao_detection: false,
+            range_normalization: false,
+            variant_normalization: false,
+            ellipsis_normalization: false,
+            range_en_dash: false,
+            grammar_checks: false,
+            ai_filler_detection: false,
+            translationese_detection: false,
+            translationese_domain:
+                crate::engine::translationese_score::TranslationeseDomain::General,
+            ai_semantic_safety: false,
+            ai_density_detection: false,
+            ai_structural_patterns: false,
+            ai_threshold_multiplier: 1.0,
+            heading_severity_boost: false,
+            political_stance: PoliticalStance::RocCentric,
+            offset_only: false,
+            exempt_blockquotes: false,
+            register: RegisterMode::Auto,
+            rhythm: false,
+        }
+    }
+
+    /// True when any AI detection stage is on.
+    ///
+    /// The four sub-flags move as a unit, and three callers ask the same
+    /// question: the score, the zero-width pass, and the CLI's post-fix
+    /// rescan. Spelled out at each of them, a fifth sub-flag reaches only the
+    /// sites someone remembers, which is how a zero-width count once reached a
+    /// caller with no issue to fix.
+    pub fn ai_detection_active(&self) -> bool {
+        self.ai_filler_detection
+            || self.ai_semantic_safety
+            || self.ai_density_detection
+            || self.ai_structural_patterns
+    }
+
+    /// Choose how CJK/Latin and CJK/digit boundaries are represented.
+    pub fn with_spacing_policy(mut self, policy: SpacingPolicy) -> Self {
+        self.spacing_policy = policy;
+        self
+    }
+
     /// Disable the named public rule families after all profile capabilities
     /// have resolved.  Subtraction is deliberately one-way: a caller can
     /// compose a profile and capabilities, then make only the unwanted
@@ -416,6 +498,7 @@ impl Profile {
                 punctuation: true,
                 quotes: true,
                 spacing: true,
+                spacing_policy: SpacingPolicy::Require,
                 colon_enforcement: true,
                 dunhao_detection: true,
                 range_normalization: true,
@@ -445,6 +528,7 @@ impl Profile {
                 punctuation: true,
                 quotes: true,
                 spacing: true,
+                spacing_policy: SpacingPolicy::Require,
                 colon_enforcement: true,
                 dunhao_detection: true,
                 range_normalization: true,

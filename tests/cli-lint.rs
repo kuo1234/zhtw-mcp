@@ -683,6 +683,34 @@ fn cli_lint_fix_rewrites_file() {
     );
 }
 
+#[test]
+fn cli_lint_spacing_strip_round_trips_through_the_fixer() {
+    // The policy has to survive the whole CLI path, not just the scanner:
+    // --spacing require writes the boundary spaces and --spacing strip takes
+    // the same file back to what it started as.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("boundary.txt");
+    let original = "在LeanCloud上有42項";
+    std::fs::write(&file, original).unwrap();
+    let path = file.to_str().unwrap().to_string();
+
+    let output = run_lint_args(&[&path, "--fix=orthographic"]);
+    assert!(output.status.success(), "require fix should exit 0");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "在 LeanCloud 上有 42 項",
+        "the default policy stores the boundary spaces"
+    );
+
+    let output = run_lint_args(&[&path, "--spacing", "strip", "--fix=orthographic"]);
+    assert!(output.status.success(), "strip fix should exit 0");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        original,
+        "strip should take the boundary spaces back out"
+    );
+}
+
 /// Install a single-rule pack under "dir" and return the packs directory to
 /// pass to "--packs-dir". Tests that need a rule with a specific shape define
 /// it here rather than leaning on whichever shipped term currently has that

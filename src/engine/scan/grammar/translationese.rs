@@ -1455,47 +1455,26 @@ struct Zy5Gate {
     min_pause_free_run: usize,
 }
 
-fn emit_zy5_span_if_qualifies(
-    em: &mut Emitter<'_>,
-    sent_text: &str,
-    sent_offset: usize,
-    span_bytes: std::ops::Range<usize>,
-    gate: Zy5Gate,
-) {
-    let (text, excluded, issues) = (em.text, em.excluded, &mut *em.issues);
-    let Zy5Gate {
-        min_chars,
-        min_de,
-        calibrated_min_de,
-        min_pause_free_run,
-    } = gate;
-    let (span_start, span_end) = (span_bytes.start, span_bytes.end);
-
+/// The longest 的-chain candidate in one comma-free span, as
+/// (end offset in the span, character count, 的 count).
+///
+/// The walk is the bulk of the ZY5 check and answers one question, so it
+/// sits apart from the gate that decides whether to report what it found.
+/// Every early exit here is a property of the span rather than of the
+/// finding: a predicate verb in the prefix, or a predicate between the
+/// first and last 的, rules out every later candidate too.
+fn best_zy5_candidate(
+    span: &str,
+    span_offset: usize,
+    excluded: &[ByteRange],
+    min_chars: usize,
+    min_de: usize,
+) -> Option<(usize, usize, usize)> {
+    let de_len = '的'.len_utf8();
     const PREDICATE_VERBS: &[&str] = &[
         "看到", "看見", "遇到", "聽到", "找到", "收到", "發現", "認識", "帶著", "帶到", "帶來",
         "告訴", "看著", "碰到", "經過",
     ];
-    if span_start >= span_end {
-        return;
-    }
-    let span = &sent_text[span_start..span_end];
-
-    // Every candidate is a prefix of the span, so the tests that look at a
-    // prefix are answered once here rather than recomputed per 的. Rescanning
-    // them made the walk quadratic in the number of 的, which the early exit
-    // below only bounds when the noun run happens to reach the end of the span:
-    // one Latin character or digit stops the run short and the walk goes back
-    // to rescanning everything.
-    if span
-        .chars()
-        .next()
-        .is_some_and(|ch| matches!(ch, '我' | '你' | '他' | '她' | '它' | '咱' | '您'))
-    {
-        // Candidates all start at the span, so this rejects every one of them.
-        return;
-    }
-
-    let de_len = '的'.len_utf8();
 
     // The 的 that count toward a candidate are those before its end, so their
     // positions are collected once and each candidate takes a slice of them.
@@ -1537,7 +1516,7 @@ fn emit_zy5_span_if_qualifies(
     while let Some(p) = span[from..].find('的') {
         let rel_de = from + p;
         from = rel_de + de_len;
-        let abs_de = sent_offset + span_start + rel_de;
+        let abs_de = span_offset + rel_de;
         if is_excluded(abs_de, abs_de + de_len, excluded) {
             continue;
         }
@@ -1580,7 +1559,7 @@ fn emit_zy5_span_if_qualifies(
             span.match_indices('的')
                 .map(|(at, _)| at)
                 .filter(|&at| {
-                    let abs = sent_offset + span_start + at;
+                    let abs = span_offset + at;
                     !is_excluded(abs, abs + de_len, excluded)
                 })
                 .collect()
@@ -1619,8 +1598,8 @@ fn emit_zy5_span_if_qualifies(
             }
         }
 
-        let abs_start = sent_offset + span_start;
-        let abs_end = sent_offset + span_start + candidate_end;
+        let abs_start = span_offset;
+        let abs_end = span_offset + candidate_end;
         if is_excluded(abs_start, abs_end, excluded) {
             continue;
         }
@@ -1638,7 +1617,47 @@ fn emit_zy5_span_if_qualifies(
             break;
         }
     }
+    best_candidate
+}
 
+fn emit_zy5_span_if_qualifies(
+    em: &mut Emitter<'_>,
+    sent_text: &str,
+    sent_offset: usize,
+    span_bytes: std::ops::Range<usize>,
+    gate: Zy5Gate,
+) {
+    let (text, excluded, issues) = (em.text, em.excluded, &mut *em.issues);
+    let Zy5Gate {
+        min_chars,
+        min_de,
+        calibrated_min_de,
+        min_pause_free_run,
+    } = gate;
+    let (span_start, span_end) = (span_bytes.start, span_bytes.end);
+
+    if span_start >= span_end {
+        return;
+    }
+    let span = &sent_text[span_start..span_end];
+
+    // Every candidate is a prefix of the span, so the tests that look at a
+    // prefix are answered once here rather than recomputed per 的. Rescanning
+    // them made the walk quadratic in the number of 的, which the early exit
+    // below only bounds when the noun run happens to reach the end of the span:
+    // one Latin character or digit stops the run short and the walk goes back
+    // to rescanning everything.
+    if span
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '我' | '你' | '他' | '她' | '它' | '咱' | '您'))
+    {
+        // Candidates all start at the span, so this rejects every one of them.
+        return;
+    }
+
+    let best_candidate =
+        best_zy5_candidate(span, sent_offset + span_start, excluded, min_chars, min_de);
     let Some((candidate_end, char_count, de_count)) = best_candidate else {
         return;
     };

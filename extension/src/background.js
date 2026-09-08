@@ -7,7 +7,7 @@ import {
 } from "./format.js";
 
 const latestResults = new Map();
-const DEFAULT_OPTIONS = { profile: "base", relaxed: false, off: [] };
+const DEFAULT_OPTIONS = { profile: "base", spacing: "require", relaxed: false, off: [] };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "RUN_SCAN_ACTIVE_TAB") {

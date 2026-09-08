@@ -303,3 +303,61 @@ fn callback_stays_silent_on_everything_but_a_lintable_write() {
         "clean file"
     );
 }
+
+#[test]
+fn project_config_layers_every_axis_the_lint_front_end_reads() {
+    // A hook that ignored these would nag about exactly what the project has
+    // already told the linter to keep quiet about.
+    let toml = r#"
+profile = "strict"
+spacing = "strip"
+relaxed = true
+off = ["quotes"]
+
+[markdown]
+exempt_blockquotes = true
+"#;
+    let project: zhtw_mcp::config::ProjectConfig = toml::from_str(toml).unwrap();
+    let cfg = project_config(Some(&project));
+    assert!(cfg.variant_normalization, "profile = strict was not read");
+    assert_eq!(
+        cfg.spacing_policy,
+        zhtw_mcp::rules::ruleset::SpacingPolicy::Strip
+    );
+    assert!(!cfg.colon_enforcement, "relaxed was not applied");
+    assert!(!cfg.quotes, "off was not applied");
+    assert!(cfg.exempt_blockquotes, "[markdown] section was not read");
+
+    // No config file is the base profile untouched.
+    assert_eq!(
+        format!("{:?}", project_config(None)),
+        format!("{:?}", Profile::Base.config()),
+    );
+}
+
+#[test]
+fn hook_honors_project_content_type_over_file_extension() {
+    let project: zhtw_mcp::config::ProjectConfig =
+        toml::from_str("content_type = \"plain\"").unwrap();
+    let content = "    這個軟件很好用\n";
+    let glossary = zhtw_mcp::rules::glossary::ProjectGlossary::default();
+
+    let markdown_issues = scan_file(content, "document.md", None, &glossary, None, None);
+    let plain_issues = scan_file(
+        content,
+        "document.md",
+        None,
+        &glossary,
+        None,
+        Some(&project),
+    );
+
+    assert!(
+        markdown_issues.is_empty(),
+        "Markdown excludes indented code"
+    );
+    assert!(
+        plain_issues.iter().any(|issue| issue.found == "軟件"),
+        "project content_type = plain must override the .md extension"
+    );
+}

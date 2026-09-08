@@ -3,6 +3,34 @@ use crate::engine::scan::ScanOutput;
 use crate::engine::zhtype::ChineseType;
 use tempfile::TempDir;
 
+/// A subject carrying placeholder file facts, for the tests whose subject is
+/// the cache key rather than the file. What a test actually varies it names,
+/// through struct update syntax, so the distinctive value is the one on the
+/// page.
+fn subject(file_path: &str) -> CacheSubject<'_> {
+    CacheSubject {
+        file_path,
+        content: b"x",
+        mtime_secs: 100,
+        size: 1,
+        input_was_sc: false,
+        text_char_count: 1,
+    }
+}
+
+/// A subject whose content is what the test is about, with `size` and
+/// `text_char_count` derived from it rather than restated. The four call sites
+/// that spelled all three out kept them consistent by hand.
+fn subject_with<'a>(file_path: &'a str, content: &'a [u8], mtime_secs: u64) -> CacheSubject<'a> {
+    CacheSubject {
+        content,
+        mtime_secs,
+        size: content.len() as u64,
+        text_char_count: content.len(),
+        ..subject(file_path)
+    }
+}
+
 fn empty_output() -> ScanOutput {
     ScanOutput {
         issues: vec![],
@@ -53,7 +81,7 @@ fn assert_variant_misses(base: &ScanParams, variant: &ScanParams) {
     let dir = TempDir::new().unwrap();
     let mut cache = ScanCache::open(dir.path().join("c.bin"));
 
-    cache.put("a.md", b"hello", 1000, 5, base, empty_output(), false, 5);
+    cache.put(subject_with("a.md", b"hello", 1000), base, empty_output());
     assert!(matches!(
         cache.check_fast("a.md", 1000, 5, base),
         CacheResult::Hit(_)
@@ -71,7 +99,7 @@ fn fast_path_hit() {
     let mut cache = ScanCache::open(dir.path().join("c.bin"));
     let p = test_params();
 
-    cache.put("a.md", b"hello", 1000, 5, &p, empty_output(), false, 5);
+    cache.put(subject_with("a.md", b"hello", 1000), &p, empty_output());
 
     // Same mtime+size = fast hit.
     assert!(matches!(
@@ -128,7 +156,7 @@ fn legacy_entries_without_engine_version_miss() {
     // serialized form to reproduce a file written by an older binary.
     {
         let mut cache = ScanCache::open(path.clone());
-        cache.put("a.md", b"hello", 1000, 5, &p, empty_output(), false, 5);
+        cache.put(subject_with("a.md", b"hello", 1000), &p, empty_output());
         cache.flush();
     }
     let raw = std::fs::read_to_string(&path).unwrap();
@@ -272,7 +300,7 @@ fn slow_path_content_check() {
     let mut cache = ScanCache::open(dir.path().join("c.bin"));
     let p = test_params_plain();
 
-    cache.put("b.md", b"data", 1000, 4, &p, empty_output(), false, 4);
+    cache.put(subject_with("b.md", b"data", 1000), &p, empty_output());
 
     // Same content despite mtime miss: slow-path hit.
     assert!(cache.check_content("b.md", b"data", &p).is_some());
@@ -289,7 +317,7 @@ fn cache_persists_to_disk() {
 
     {
         let mut cache = ScanCache::open(path.clone());
-        cache.put("f.md", b"x", 100, 1, &p, empty_output(), false, 1);
+        cache.put(subject("f.md"), &p, empty_output());
         cache.flush();
     }
 
@@ -305,7 +333,7 @@ fn expired_entries_pruned() {
     let dir = TempDir::new().unwrap();
     let mut cache = ScanCache::open(dir.path().join("c.bin"));
     let p = test_params_plain();
-    cache.put("e.md", b"x", 100, 1, &p, empty_output(), false, 1);
+    cache.put(subject("e.md"), &p, empty_output());
     for entry in cache.entries_mut().values_mut() {
         entry.timestamp_secs = 0;
     }
@@ -327,7 +355,7 @@ fn overflow_evicts_oldest() {
     let base = now_secs() - (MAX_ENTRIES as u64 + 10);
     for i in 0..MAX_ENTRIES + 10 {
         let name = format!("file_{i}.md");
-        cache.put(&name, b"x", 100, 1, &p, empty_output(), false, 1);
+        cache.put(subject(&name), &p, empty_output());
         let key = fast_key(&name, &p);
         if let Some(e) = cache.entries_mut().get_mut(&key) {
             e.timestamp_secs = base + i as u64;
@@ -373,27 +401,13 @@ fn pathological_issue_count_is_not_cached() {
     let p = test_params_plain();
 
     cache.put(
-        "huge.md",
-        b"x",
-        100,
-        1,
+        subject("huge.md"),
         &p,
         output_with_issues(MAX_ENTRY_ISSUES + 1),
-        false,
-        1,
     );
     assert!(cache.entries().is_empty(), "oversized entry was stored");
 
-    cache.put(
-        "ok.md",
-        b"x",
-        100,
-        1,
-        &p,
-        output_with_issues(MAX_ENTRY_ISSUES),
-        false,
-        1,
-    );
+    cache.put(subject("ok.md"), &p, output_with_issues(MAX_ENTRY_ISSUES));
     assert_eq!(cache.entries().len(), 1, "entry at the cap was rejected");
 }
 
@@ -453,13 +467,20 @@ fn flush_keeps_entries_another_process_wrote_after_we_loaded() {
     let p = test_params_plain();
 
     let mut ours = ScanCache::open(path.clone());
-    ours.put("ours.md", b"x", 100, 1, &p, empty_output(), false, 1);
+    ours.put(subject("ours.md"), &p, empty_output());
     ours.entries(); // take the snapshot
 
     // Meanwhile, another process writes a disjoint entry and exits.
     {
         let mut theirs = ScanCache::open(path.clone());
-        theirs.put("theirs.md", b"y", 100, 1, &p, empty_output(), false, 1);
+        theirs.put(
+            CacheSubject {
+                content: b"y",
+                ..subject("theirs.md")
+            },
+            &p,
+            empty_output(),
+        );
         theirs.flush();
     }
     let (mid, _) = load_entries(&path, DEFAULT_TTL_SECS);
@@ -488,7 +509,14 @@ fn fast_path_declines_while_the_recorded_mtime_is_this_second() {
     let p = test_params_plain();
     let now = now_secs();
 
-    cache.put("fresh.md", b"x", now, 1, &p, empty_output(), false, 1);
+    cache.put(
+        CacheSubject {
+            mtime_secs: now,
+            ..subject("fresh.md")
+        },
+        &p,
+        empty_output(),
+    );
     assert!(
         matches!(cache.check_fast("fresh.md", now, 1, &p), CacheResult::Miss),
         "fast path trusted an mtime from this second"
@@ -496,7 +524,14 @@ fn fast_path_declines_while_the_recorded_mtime_is_this_second() {
 
     // An older mtime is outside the window and still hits.
     let old = now - 60;
-    cache.put("settled.md", b"x", old, 1, &p, empty_output(), false, 1);
+    cache.put(
+        CacheSubject {
+            mtime_secs: old,
+            ..subject("settled.md")
+        },
+        &p,
+        empty_output(),
+    );
     assert!(
         matches!(
             cache.check_fast("settled.md", old, 1, &p),
@@ -518,7 +553,14 @@ fn an_entry_stored_while_fresh_stays_off_the_fast_path() {
     let p = test_params_plain();
     let now = now_secs();
 
-    cache.put("fresh.md", b"x", now, 1, &p, empty_output(), false, 1);
+    cache.put(
+        CacheSubject {
+            mtime_secs: now,
+            ..subject("fresh.md")
+        },
+        &p,
+        empty_output(),
+    );
     let key = fast_key("fresh.md", &p);
 
     // Age the entry by an hour. Its mtime is still the second it was written
@@ -542,7 +584,7 @@ fn flush_creates_the_cache_directory_before_taking_the_lock() {
     let p = test_params_plain();
 
     let mut cache = ScanCache::open(path.clone());
-    cache.put("a.md", b"x", 100, 1, &p, empty_output(), false, 1);
+    cache.put(subject("a.md"), &p, empty_output());
     cache.flush();
 
     assert!(path.exists(), "cache file was not written");
@@ -563,7 +605,7 @@ fn flush_keeps_the_newer_of_two_entries_for_one_key() {
     let p = test_params_plain();
 
     let mut ours = ScanCache::open(path.clone());
-    ours.put("same.md", b"x", 100, 1, &p, empty_output(), false, 1);
+    ours.put(subject("same.md"), &p, empty_output());
     let key = fast_key("same.md", &p);
     let stale = now_secs() - 500;
     if let Some(e) = ours.entries_mut().get_mut(&key) {
@@ -572,7 +614,17 @@ fn flush_keeps_the_newer_of_two_entries_for_one_key() {
 
     {
         let mut theirs = ScanCache::open(path.clone());
-        theirs.put("same.md", b"y", 200, 2, &p, empty_output(), false, 9);
+        theirs.put(
+            CacheSubject {
+                content: b"y",
+                mtime_secs: 200,
+                size: 2,
+                text_char_count: 9,
+                ..subject("same.md")
+            },
+            &p,
+            empty_output(),
+        );
         theirs.flush();
     }
 
@@ -600,7 +652,7 @@ fn byte_cap_does_not_bind_on_a_normal_full_cache() {
     let base = now_secs() - MAX_ENTRIES as u64;
     for i in 0..MAX_ENTRIES {
         let name = format!("file_{i}.md");
-        cache.put(&name, b"x", 100, 1, &p, output_with_issues(20), false, 1);
+        cache.put(subject(&name), &p, output_with_issues(20));
         let key = fast_key(&name, &p);
         if let Some(e) = cache.entries_mut().get_mut(&key) {
             e.timestamp_secs = base + i as u64;
@@ -641,16 +693,7 @@ fn total_size_cap_evicts_oldest() {
     let base = now_secs() - 300;
     for i in 0..300 {
         let name = format!("file_{i}.md");
-        cache.put(
-            &name,
-            b"x",
-            100,
-            1,
-            &p,
-            output_with_bytes(OVERSIZE_FILLER),
-            false,
-            1,
-        );
+        cache.put(subject(&name), &p, output_with_bytes(OVERSIZE_FILLER));
         let key = fast_key(&name, &p);
         if let Some(e) = cache.entries_mut().get_mut(&key) {
             e.timestamp_secs = base + i as u64;
@@ -725,14 +768,15 @@ fn char_count_survives_cache_hits() {
     let p = test_params_plain();
 
     cache.put(
-        "chars.md",
-        "甲乙丙".as_bytes(),
-        1000,
-        9,
+        CacheSubject {
+            content: "甲乙丙".as_bytes(),
+            mtime_secs: 1000,
+            size: 9,
+            text_char_count: 3,
+            ..subject("chars.md")
+        },
         &p,
         empty_output(),
-        false,
-        3,
     );
 
     let fast_hit = cache
@@ -753,7 +797,17 @@ fn legacy_entries_without_char_count_miss_until_refreshed() {
     let mut cache = ScanCache::open(dir.path().join("c.bin"));
     let p = test_params_plain();
 
-    cache.put("legacy.md", b"abc", 1000, 3, &p, empty_output(), false, 0);
+    cache.put(
+        CacheSubject {
+            content: b"abc",
+            mtime_secs: 1000,
+            size: 3,
+            text_char_count: 0,
+            ..subject("legacy.md")
+        },
+        &p,
+        empty_output(),
+    );
 
     assert!(matches!(
         cache.check_fast("legacy.md", 1000, 3, &p),

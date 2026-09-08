@@ -138,6 +138,17 @@ fn off_is_repeatable_and_rejects_unknown_families() {
 }
 
 #[test]
+fn spacing_policy_accepts_its_two_values() {
+    use zhtw_mcp::rules::ruleset::SpacingPolicy;
+
+    assert_eq!(
+        lint_of(&["lint", "--spacing", "strip", "a.md"]).spacing,
+        Some(SpacingPolicy::Strip)
+    );
+    assert!(err_of(&["lint", "--spacing", "off", "a.md"]).contains("unknown --spacing value"));
+}
+
+#[test]
 fn rhythm_is_a_bare_flag_that_composes() {
     let lint = lint_of(&["lint", "--rhythm", "a.md"]);
     assert!(lint.rhythm);

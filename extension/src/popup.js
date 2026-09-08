@@ -7,6 +7,7 @@ const metaNode = document.querySelector("#meta");
 const issueListNode = document.querySelector("#issue-list");
 const scanButton = document.querySelector("#scan-button");
 const profileInput = document.querySelector("#profile");
+const spacingInput = document.querySelector("#spacing");
 const relaxedInput = document.querySelector("#relaxed");
 const offInput = document.querySelector("#off");
 
@@ -34,6 +35,7 @@ async function runScan() {
       type: "RUN_SCAN_ACTIVE_TAB",
       options: {
         profile: profileInput.value,
+        spacing: spacingInput.value,
         relaxed: relaxedInput.checked,
         // Subtracted after the profile resolves, the same order the CLI and the
         // MCP tool apply --off in.

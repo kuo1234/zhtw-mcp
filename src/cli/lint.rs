@@ -17,6 +17,7 @@ use crate::cli::render::{
 };
 use crate::cli::render::{use_color, Colors, COLORS_OFF, COLORS_ON};
 use crate::{EXIT_FAILURE, EXIT_GATE};
+use zhtw_mcp::cache::CacheSubject;
 
 pub(crate) struct LintBatchParams<'a> {
     pub(crate) file_args: &'a [String],
@@ -24,6 +25,7 @@ pub(crate) struct LintBatchParams<'a> {
     pub(crate) max_errors: usize,
     pub(crate) max_warnings: Option<usize>,
     pub(crate) profile_name: Option<&'a str>,
+    pub(crate) spacing: Option<zhtw_mcp::rules::ruleset::SpacingPolicy>,
     pub(crate) off: &'a [zhtw_mcp::rules::ruleset::RuleFamily],
     pub(crate) content_type_override: Option<&'a str>,
     pub(crate) overrides_path: &'a Path,
@@ -126,6 +128,9 @@ fn build_lint_setup(
     let mut cfg = profile.config();
     if params.relaxed {
         cfg = cfg.with_relaxed();
+    }
+    if let Some(policy) = params.spacing {
+        cfg = cfg.with_spacing_policy(policy);
     }
     if params.exempt_blockquotes {
         cfg = cfg.with_exempt_blockquotes(true);
@@ -564,14 +569,16 @@ impl ScanCtx<'_> {
                 if let Some(Ok(mut c)) = scan_cache.as_ref().map(|mtx| mtx.lock()) {
                     let mtime = zhtw_mcp::cache::mtime_secs(&meta);
                     c.put(
-                        file_arg,
-                        text.as_bytes(),
-                        mtime,
-                        meta.len(),
+                        CacheSubject {
+                            file_path: file_arg,
+                            content: text.as_bytes(),
+                            mtime_secs: mtime,
+                            size: meta.len(),
+                            input_was_sc,
+                            text_char_count,
+                        },
                         &cache_params,
                         o.clone(),
-                        input_was_sc,
-                        text_char_count,
                     );
                 }
                 o
@@ -879,11 +886,7 @@ fn rescan_written_text(
             .scanner
             .scan_for_content_type_with_config(current_text, content_type, cfg);
 
-    let ai_active = cfg.ai_filler_detection
-        || cfg.ai_semantic_safety
-        || cfg.ai_density_detection
-        || cfg.ai_structural_patterns;
-    if ai_active {
+    if cfg.ai_detection_active() {
         *ai_signature = rescan_output.ai_signature;
     }
     if cfg.translationese_detection {

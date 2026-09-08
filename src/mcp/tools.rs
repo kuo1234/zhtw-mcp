@@ -6,16 +6,10 @@
 use std::cell::OnceCell;
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::prompts;
 use super::resources;
-use rmcp::model::{
-    CacheScope, CallToolResult, ContentBlock, GetPromptResult, JsonObject, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, ReadResourceResult, Tool,
-    ToolAnnotations,
-};
+use rmcp::model::{CacheScope, CallToolResult, ReadResourceResult};
 use rmcp::ErrorData;
 
 use super::sampling::{refine_issues_with_sampling, SamplingBridge, SamplingStats};
@@ -23,7 +17,7 @@ use super::telemetry::{TelemetryMetrics, TokenTelemetry};
 use crate::audit::Trace;
 use crate::engine::disambig::{disambiguate_batch, DisambigConfig, DisambigStats};
 use crate::engine::s2t::S2TConverter;
-use crate::engine::scan::{is_spaced_acronym_issue, ContentType, Scanner};
+use crate::engine::scan::{ContentType, Scanner};
 #[cfg(feature = "translate")]
 use crate::engine::translate::calibrate_issues;
 use crate::engine::zhtype::{detect_chinese_type, ChineseType};
@@ -37,6 +31,20 @@ use crate::rules::ruleset::{
     AttributionGenre, Issue, IssueType, PoliticalStance, Profile, ResolutionTier, Severity,
 };
 use crate::rules::store::{OverrideStore, PackStore, SuppressionStore, TranslationMemoryStore};
+
+mod output;
+mod params;
+mod schema;
+
+use output::*;
+pub use output::{
+    compress_locations, escape_tsv_field, group_issues, shorten_severity, shorten_type, IssueGroup,
+};
+pub(crate) use params::ParamResult;
+use params::*;
+pub(crate) use schema::{
+    get_prompt, list_prompts, list_resource_templates, list_resources, list_tools,
+};
 
 /// What the server reads and never changes: the compiled scanner and the
 /// ruleset metadata derived from it.
@@ -331,6 +339,7 @@ impl Server {
             relaxed,
             exempt_blockquotes,
             rhythm,
+            spacing,
             include_telemetry,
             include_stats,
             #[cfg(feature = "translate")]
@@ -394,6 +403,7 @@ impl Server {
                 register: register_opt.as_deref(),
                 ai_threshold,
                 rhythm,
+                spacing,
                 off,
             },
         )?;
@@ -435,24 +445,13 @@ impl Server {
 
     /// Per-request token telemetry, with the judgment-cache counters reduced
     /// to this request's share of the process totals.
-    #[allow(clippy::too_many_arguments)]
     fn request_telemetry(
         &self,
-        text: &str,
-        scanner_hit_count: usize,
-        disambig_stats: &DisambigStats,
-        sampling_stats: &SamplingStats,
-        bridge: Option<&&mut SamplingBridge<'_>>,
-        applied_fixes: usize,
+        counts: TelemetryCounts<'_>,
         cache_before: (u64, u64),
     ) -> TelemetryMetrics {
         build_telemetry(
-            text,
-            scanner_hit_count,
-            disambig_stats,
-            sampling_stats,
-            bridge,
-            applied_fixes,
+            counts,
             (
                 self.judgment_cache.hits.saturating_sub(cache_before.0),
                 self.judgment_cache.misses.saturating_sub(cache_before.1),
@@ -537,12 +536,14 @@ impl Server {
         // Build telemetry if requested.
         let telemetry = include_telemetry.then(|| {
             self.request_telemetry(
-                text,
-                scanner_hit_count,
-                &disambig_stats,
-                &sampling_stats,
-                bridge.as_ref(),
-                0,
+                TelemetryCounts {
+                    text,
+                    scanner_hit_count,
+                    disambig_stats: &disambig_stats,
+                    sampling_stats: &sampling_stats,
+                    est_tokens: est_tokens(bridge.as_ref()),
+                    applied_fixes: 0,
+                },
                 (cache_hits_before, cache_misses_before),
             )
         });
@@ -592,6 +593,72 @@ impl Server {
             include_stats,
             consistency: consistency_report.as_ref(),
         })
+    }
+
+    /// Apply `mode` to the issues the translation memory has not vetoed.
+    ///
+    /// A term the user deliberately rejected must not be auto-corrected, so
+    /// the veto is applied to what goes into the fixer rather than to what
+    /// comes out of it.
+    fn apply_vetted_fixes(
+        &self,
+        text: &str,
+        mut issues: Vec<Issue>,
+        mode: FixMode,
+        excluded: &[crate::engine::excluded::ByteRange],
+    ) -> crate::fixer::FixResult {
+        // Taken by value and filtered in place. The caller is done with the
+        // list, and cloning it here would allocate a String per issue to hand
+        // the fixer what it already had.
+        if let Some(tm) = &self.tm_store {
+            issues.retain(|i| !tm.should_suppress(&i.found));
+        }
+        apply_fixes_with_context(
+            text,
+            &issues,
+            mode,
+            excluded,
+            Some(self.catalog.scanner.segmenter()),
+        )
+    }
+
+    /// Bring the re-scan's issues back in line with what the request asked
+    /// for, and report how many the translation memory suppressed.
+    ///
+    /// Order matters throughout: severity is restored before the TM runs, so
+    /// the count reflects the final state rather than a pre-fix snapshot.
+    fn reconcile_rescan(
+        &mut self,
+        remaining_issues: &mut Vec<Issue>,
+        ctx: RescanContext<'_>,
+    ) -> usize {
+        if let Some(st) = ctx.stance {
+            filter_by_stance(remaining_issues, st);
+        }
+        self.apply_suppressions(remaining_issues);
+        apply_ignore_set(remaining_issues, ctx.ignore_set);
+
+        restore_preserved_states(
+            remaining_issues,
+            ctx.preserved_states,
+            &ctx.fix_result.applied_fixes,
+        );
+
+        // Suppress convergent-chain noise: remove re-scan issues whose offset
+        // falls within a byte range written by the fixer.
+        suppress_convergent_issues(remaining_issues, &ctx.fix_result.applied_fixes);
+
+        *remaining_issues = crate::rules::glossary::apply_glossary_with_coordinates(
+            &ctx.fix_result.text,
+            ctx.content_type,
+            ctx.cfg,
+            std::mem::take(remaining_issues),
+            ctx.glossary,
+        );
+
+        // Apply TM after preserved state restoration so the count reflects the
+        // true final state, not a pre-fix snapshot.
+        self.apply_tm(remaining_issues)
     }
 
     /// Fix: the shared scan stage, then apply the fixes and re-scan the result
@@ -658,27 +725,9 @@ impl Server {
         );
 
         // Snapshot AFTER suppressions so restored severity reflects final
-        // state.
+        // state, then fix what the TM has not vetoed.
         let preserved_states = snapshot_states(&issues);
-
-        // Filter out TM-suppressed issues before fixing: a term the user
-        // deliberately rejected must not be auto-corrected.
-        let fix_issues: Vec<Issue> = match &self.tm_store {
-            Some(tm) => issues
-                .iter()
-                .filter(|i| !tm.should_suppress(&i.found))
-                .cloned()
-                .collect(),
-            None => issues.clone(),
-        };
-
-        let fix_result = apply_fixes_with_context(
-            text,
-            &fix_issues,
-            mode,
-            &excluded,
-            Some(self.catalog.scanner.segmenter()),
-        );
+        let fix_result = self.apply_vetted_fixes(text, issues, mode, &excluded);
 
         // Re-scan after fixes: use post-fix ai_signature, not pre-fix. Remap
         // exclusion zones to post-fix coordinates instead of rebuilding from
@@ -697,33 +746,18 @@ impl Server {
         let ai_signature = rescan_out.ai_signature;
         let translationese_signature = rescan_out.translationese_signature;
         let mut remaining_issues = rescan_out.issues;
-        if let Some(st) = stance {
-            filter_by_stance(&mut remaining_issues, st);
-        }
-        self.apply_suppressions(&mut remaining_issues);
-        apply_ignore_set(&mut remaining_issues, ignore_set);
-
-        restore_preserved_states(
+        let tm_suppressed = self.reconcile_rescan(
             &mut remaining_issues,
-            &preserved_states,
-            &fix_result.applied_fixes,
+            RescanContext {
+                stance,
+                ignore_set,
+                preserved_states: &preserved_states,
+                fix_result: &fix_result,
+                content_type,
+                cfg: &cfg,
+                glossary,
+            },
         );
-
-        // Suppress convergent-chain noise: remove re-scan issues whose offset
-        // falls within a byte range written by the fixer.
-        suppress_convergent_issues(&mut remaining_issues, &fix_result.applied_fixes);
-
-        remaining_issues = crate::rules::glossary::apply_glossary_with_coordinates(
-            &fix_result.text,
-            content_type,
-            &cfg,
-            remaining_issues,
-            glossary,
-        );
-
-        // Apply TM after preserved state restoration so the count reflects the
-        // true final state, not a pre-fix snapshot.
-        let tm_suppressed = self.apply_tm(&mut remaining_issues);
 
         let consistency_report = consistency_requested
             .then(|| {
@@ -738,12 +772,14 @@ impl Server {
         // Build telemetry if requested.
         let telemetry = include_telemetry.then(|| {
             self.request_telemetry(
-                text,
-                scanner_hit_count,
-                &disambig_stats,
-                &sampling_stats,
-                bridge.as_ref(),
-                fix_result.applied,
+                TelemetryCounts {
+                    text,
+                    scanner_hit_count,
+                    disambig_stats: &disambig_stats,
+                    sampling_stats: &sampling_stats,
+                    est_tokens: est_tokens(bridge.as_ref()),
+                    applied_fixes: fix_result.applied,
+                },
                 (cache_hits_before, cache_misses_before),
             )
         });
@@ -832,605 +868,6 @@ impl Server {
     }
 }
 
-/// Result of parsing a request or tool argument.
-///
-/// The error side is RMCP's own, because that is what the adapter hands back
-/// and nothing between here and the wire adds to it. It carries the JSON-RPC
-/// code, the message, and the structured data clients render diagnostics from.
-/// Which request id the error correlates to is RMCP's business, not this
-/// layer's, which is why none of these helpers take one.
-pub(crate) type ParamResult<T> = Result<T, ErrorData>;
-
-/// Return an INVALID_PARAMS JSON-RPC error if `args` contains keys not in
-/// the known parameter set. Returns `None` when all keys are recognized.
-fn reject_unknown_params(args: &Value) -> Option<ErrorData> {
-    let obj = args.as_object()?;
-    let known = input_schema_properties();
-    let unexpected: Vec<&str> = obj
-        .keys()
-        .filter(|k| !known.contains_key(k.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unexpected.is_empty() {
-        return None;
-    }
-    Some(ErrorData::invalid_params(
-        format!(
-            "unknown parameter{}: {}",
-            if unexpected.len() > 1 { "s" } else { "" },
-            unexpected.join(", "),
-        ),
-        Some(json!({ "unexpected": unexpected })),
-    ))
-}
-
-/// The values the schema declares for an enum-valued parameter.
-///
-/// Empty for a parameter the schema does not constrain to a list, which is
-/// what `param_error` is for.
-fn accepted_values(field: &str) -> Vec<&'static str> {
-    let Some(prop) = input_schema_properties().get(field) else {
-        return Vec::new();
-    };
-
-    // An array parameter carries its enum on the item schema: the array itself
-    // has no fixed set of values, its entries do. Reading only the top level
-    // would hand the client an empty accepted list for such a field.
-    prop.get("enum")
-        .or_else(|| prop.get("items").and_then(|items| items.get("enum")))
-        .and_then(|values| values.as_array())
-        .map(|values| values.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
-}
-
-/// Reject a value the schema does not allow, naming what it does.
-///
-/// The list comes from the schema rather than from the call site: stating it
-/// twice is how a value gets added to what the tool advertises and still
-/// rejected by what parses it.
-fn enum_param_error(field: &str, value: &str) -> ErrorData {
-    param_error(field, value, &accepted_values(field))
-}
-
-/// Build a structured INVALID_PARAMS JSON-RPC error for a bad tool parameter.
-/// The `data` field carries `{"field", "value", "accepted"}` so clients can
-/// render actionable diagnostics without parsing the message string.
-fn param_error(field: &str, value: &str, accepted: &[&str]) -> ErrorData {
-    ErrorData::invalid_params(
-        format!("invalid '{field}': '{value}'"),
-        Some(json!({ "field": field, "value": value, "accepted": accepted })),
-    )
-}
-
-/// Extract a required string field from a JSON object, returning a
-/// structured INVALID_PARAMS error on failure. Distinguishes missing
-/// field from present-but-wrong-type so clients get actionable diagnostics.
-fn require_str_validated<'a>(args: &'a Value, field: &str) -> ParamResult<&'a str> {
-    match args.get(field) {
-        None => Err(ErrorData::invalid_params(
-            format!("missing required parameter '{field}'"),
-            Some(json!({ "field": field })),
-        )),
-        Some(v) => v.as_str().ok_or_else(|| {
-            let type_name = json_type_name(v);
-            ErrorData::invalid_params(
-                format!("'{field}' must be a string, got {type_name}"),
-                Some(
-                    json!({ "field": field, "expected_type": "string", "actual_type": type_name }),
-                ),
-            )
-        }),
-    }
-}
-
-/// Extract an optional string field, returning INVALID_PARAMS if the
-/// value is present but not a string. Returns `Ok(None)` when absent.
-fn optional_str_validated<'a>(args: &'a Value, field: &str) -> ParamResult<Option<&'a str>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(v) => match v.as_str() {
-            Some(s) => Ok(Some(s)),
-            None => {
-                let type_name = json_type_name(v);
-                Err(ErrorData::invalid_params(
-                    format!("'{field}' must be a string, got {type_name}"),
-                    Some(
-                        json!({ "field": field, "expected_type": "string", "actual_type": type_name }),
-                    ),
-                ))
-            }
-        },
-    }
-}
-
-/// Human-readable JSON type name for error diagnostics.
-fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Number(_) => "number",
-        Value::Bool(_) => "boolean",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-        Value::Null => "null",
-        Value::String(_) => "string",
-    }
-}
-
-/// Everything `tool_check` reads out of its JSON arguments.
-///
-/// Exists to give the parsing a name and a home, not to be passed around: the
-/// caller destructures it immediately, so the body works with the same locals
-/// it always did.  That is deliberate.  A struct threaded through four hundred
-/// lines would have meant renaming every use, which is a lot of silent risk for
-/// a change whose whole point is legibility.
-struct CheckParams<'a> {
-    fix_mode: FixMode,
-    profile: Profile,
-    content_type: ContentType,
-    stance: Option<PoliticalStance>,
-    max_errors: Option<u64>,
-    max_warnings: Option<u64>,
-    ignore_terms: Vec<String>,
-    explain: bool,
-    output_mode: OutputMode,
-    fix_output: FixOutputMode,
-    #[cfg(feature = "translate")]
-    verify: bool,
-    /// Explicit bool overrides the profile default; absent means inherit.  The
-    /// default profile enables both AI-filler and translationese detection.
-    detect_ai_opt: Option<bool>,
-    detect_translationese_opt: Option<bool>,
-    /// Composite three-axis scorecard, opt-in.  Mirrors the CLI
-    /// `--detect-style` shorthand; off by default to keep the payload lean.
-    detect_style: bool,
-    translationese_domain_opt: Option<String>,
-    document_genre_opt: Option<String>,
-    register_opt: Option<String>,
-    ai_threshold: Option<&'a str>,
-    relaxed: bool,
-    exempt_blockquotes: bool,
-    /// Advisory rhythm (氣口) axis. Opt-in and never fixable, exactly as on
-    /// the CLI: the tool exposes it so an agent can ask for the same advice a
-    /// human gets from --rhythm.
-    rhythm: bool,
-    off: Vec<crate::rules::ruleset::RuleFamily>,
-    glossary: crate::rules::glossary::ProjectGlossary,
-    consistency_requested: bool,
-    include_telemetry: bool,
-    include_stats: bool,
-}
-
-impl<'a> CheckParams<'a> {
-    fn parse(args: &'a Value, default_output: OutputMode) -> ParamResult<Self> {
-        Ok(Self {
-            fix_mode: parse_fix_mode(args)?,
-            profile: parse_profile(args)?,
-            content_type: parse_content_type(args)?,
-            stance: parse_political_stance(args)?,
-            max_errors: args.get("max_errors").and_then(|v| v.as_u64()),
-            max_warnings: args.get("max_warnings").and_then(|v| v.as_u64()),
-            ignore_terms: parse_ignore_terms(args),
-            explain: parse_explain(args),
-            output_mode: parse_output_mode(args, default_output)?,
-            fix_output: parse_fix_output(args)?,
-            #[cfg(feature = "translate")]
-            verify: parse_verify(args),
-            detect_ai_opt: parse_flag_opt(args, "detect_ai"),
-            detect_translationese_opt: parse_flag_opt(args, "detect_translationese"),
-            detect_style: parse_flag(args, "detect_style"),
-            translationese_domain_opt: args
-                .get("translationese_domain")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            document_genre_opt: optional_str_validated(args, "document_genre")?.map(str::to_string),
-            register_opt: optional_str_validated(args, "register")?.map(str::to_string),
-            ai_threshold: optional_str_validated(args, "ai_threshold")?,
-            relaxed: parse_flag(args, "relaxed"),
-            exempt_blockquotes: parse_flag(args, "exempt_blockquotes"),
-            rhythm: parse_flag(args, "rhythm"),
-            off: parse_off(args)?,
-            glossary: parse_glossary(args),
-            consistency_requested: parse_flag(args, "consistency"),
-            include_telemetry: parse_flag(args, "include_telemetry"),
-            include_stats: parse_flag(args, "include_stats"),
-        })
-    }
-}
-
-/// An optional boolean argument, absent meaning "inherit the default".
-fn parse_flag_opt(args: &Value, field: &str) -> Option<bool> {
-    args.get(field).and_then(|v| v.as_bool())
-}
-
-/// A boolean argument that defaults to false when absent or malformed.
-fn parse_flag(args: &Value, field: &str) -> bool {
-    parse_flag_opt(args, field).unwrap_or(false)
-}
-
-/// Parse public rule-family subtractions.  The schema guides regular clients,
-/// but this remains strict because direct JSON-RPC calls bypass it.
-fn parse_off(args: &Value) -> ParamResult<Vec<crate::rules::ruleset::RuleFamily>> {
-    let Some(value) = args.get("off") else {
-        return Ok(Vec::new());
-    };
-    let values = value.as_array().ok_or_else(|| {
-        ErrorData::invalid_params(
-            "'off' must be an array of rule family names",
-            Some(json!({ "field": "off", "expected_type": "array" })),
-        )
-    })?;
-    // Repeats are harmless: with_disabled only clears flags.
-    values
-        .iter()
-        .map(|entry| {
-            let name = entry.as_str().ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "'off' entries must be strings",
-                    Some(json!({ "field": "off", "expected_type": "string" })),
-                )
-            })?;
-            crate::rules::ruleset::RuleFamily::from_str_strict(name)
-                .ok_or_else(|| enum_param_error("off", name))
-        })
-        .collect()
-}
-
-/// Parse the optional "fix_mode" field from tool arguments.
-/// Returns an INVALID_PARAMS error for unrecognized values.
-fn parse_fix_mode(args: &Value) -> ParamResult<FixMode> {
-    match optional_str_validated(args, "fix_mode")? {
-        Some("orthographic") => Ok(FixMode::Orthographic),
-        Some("lexical_safe") => Ok(FixMode::LexicalSafe),
-        Some("lexical_contextual") => Ok(FixMode::LexicalContextual),
-        None | Some("none") => Ok(FixMode::None),
-        Some(other) => Err(enum_param_error("fix_mode", other)),
-    }
-}
-
-/// Parse the optional "content_type" field from tool arguments.
-/// Returns an INVALID_PARAMS error for unrecognized values.
-fn parse_content_type(args: &Value) -> ParamResult<ContentType> {
-    match optional_str_validated(args, "content_type")? {
-        // Plain, not the file-name guess the CLI makes: a tool call carries
-        // text and no name to guess from, and reading unmarked text as Markdown
-        // would skip whatever looks like a fence inside it.
-        None => Ok(ContentType::Plain),
-        Some(other) => {
-            ContentType::from_name(other).ok_or_else(|| enum_param_error("content_type", other))
-        }
-    }
-}
-
-/// Parse the optional "profile" field from tool arguments.
-/// Returns an INVALID_PARAMS error for unrecognized values.
-fn parse_profile(args: &Value) -> ParamResult<Profile> {
-    match optional_str_validated(args, "profile")? {
-        None => Ok(Profile::Base),
-        Some(s) => Profile::from_str_strict(s).ok_or_else(|| enum_param_error("profile", s)),
-    }
-}
-
-/// Parse the optional "political_stance" field from tool arguments.
-/// Returns an INVALID_PARAMS error for unrecognized values.
-fn parse_political_stance(args: &Value) -> ParamResult<Option<PoliticalStance>> {
-    match optional_str_validated(args, "political_stance")? {
-        None => Ok(None),
-        Some(s) => PoliticalStance::from_str_strict(s)
-            .map(Some)
-            .ok_or_else(|| enum_param_error("political_stance", s)),
-    }
-}
-
-/// Fix output format: how corrected text is returned when fixes are applied.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FixOutputMode {
-    /// Return the full corrected text (backward compat default).
-    Full,
-    /// Return search/replace blocks (LLM-friendly patching format).
-    SearchReplace,
-    /// Return a patches array with byte offsets into the original text.
-    Patch,
-}
-
-impl FixOutputMode {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::SearchReplace => "search_replace",
-            Self::Patch => "patch",
-        }
-    }
-}
-
-/// Parse the optional "fix_output" parameter from tool arguments.
-fn parse_fix_output(args: &Value) -> ParamResult<FixOutputMode> {
-    match optional_str_validated(args, "fix_output")? {
-        Some("full") | None => Ok(FixOutputMode::Full),
-        Some("search_replace") => Ok(FixOutputMode::SearchReplace),
-        Some("patch") => Ok(FixOutputMode::Patch),
-        Some(other) => Err(enum_param_error("fix_output", other)),
-    }
-}
-
-/// Parse the optional "explain" boolean from tool arguments.
-fn parse_explain(args: &Value) -> bool {
-    args.get("explain")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-/// Output mode for zhtw responses.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
-    Full,
-    Compact,
-    /// Header-once TSV format for LLM-facing responses.
-    /// Eliminates JSON syntax tax (repeated keys, braces, quotes) that
-    /// inflates BPE token count by 40-60% with zero semantic value.
-    Tabular,
-    /// AI summary only: issue counts + AI signature report.
-    /// No individual issues, no text. Lets downstream tools quickly
-    /// decide whether to trigger a full review.
-    Summary,
-}
-
-/// Parse the optional "output" mode from tool arguments.
-/// When no explicit value is given, uses the provided default (which may
-/// be auto-detected from the client identity).
-fn parse_output_mode(args: &Value, default: OutputMode) -> ParamResult<OutputMode> {
-    match optional_str_validated(args, "output")? {
-        Some("compact") => Ok(OutputMode::Compact),
-        Some("full") => Ok(OutputMode::Full),
-        Some("tabular") => Ok(OutputMode::Tabular),
-        Some("summary") => Ok(OutputMode::Summary),
-        None => Ok(default),
-        Some(other) => Err(enum_param_error("output", other)),
-    }
-}
-
-/// Known AI agent/CLI client names that benefit from compact output.
-/// Matched as exact full-name against the lowercased `clientInfo.name`.
-/// Only programmatic agents/CLIs: NOT desktop GUI apps like "Claude Desktop".
-const AI_AGENT_CLIENTS: &[&str] = &[
-    "claude-code",
-    "claude code",
-    "cursor",
-    "cline",
-    "continue",
-    "zed",
-    "windsurf",
-    "copilot",
-    "aider",
-    "cody",
-    "roo",
-    "roo-code",
-    "roo code",
-];
-
-/// Determine default output mode from client identity.
-/// Uses exact full-name match only to avoid false positives on clients
-/// like "Claude Desktop" that happen to share a token with an agent name.
-/// Strips trailing version suffixes (`/1.0`, ` 1.0`) before matching,
-/// since some clients embed version info in the name field.
-fn default_output_mode(client_name: Option<&str>) -> OutputMode {
-    match client_name {
-        Some(name) => {
-            let lower = name.to_ascii_lowercase();
-
-            // Strip trailing version suffix: "Cursor/0.1.0" → "cursor", "cline
-            // 1.2" → "cline"
-            let base = lower
-                .split('/')
-                .next()
-                .unwrap_or(&lower)
-                .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
-                .trim();
-            if AI_AGENT_CLIENTS.contains(&base) {
-                OutputMode::Compact
-            } else {
-                OutputMode::Full
-            }
-        }
-        None => OutputMode::Full,
-    }
-}
-
-/// Parse the optional "verify" flag from tool arguments.
-#[cfg(feature = "translate")]
-fn parse_verify(args: &Value) -> bool {
-    args.get("verify")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-/// Generate a cultural/linguistic explanation for an issue.
-///
-/// Draws from the context, english, and rule_type fields to produce
-/// a brief explanation useful for AI agents and educational applications.
-fn build_explanation(issue: &Issue) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-
-    match issue.rule_type {
-        IssueType::CrossStrait => {
-            if let Some(eng) = &issue.english {
-                parts.push(format!(
-                    "'{}' is a mainland Chinese term for '{}'; Taiwan uses '{}'.",
-                    issue.found,
-                    eng,
-                    issue.suggestions.join(" / "),
-                ));
-            } else if !issue.suggestions.is_empty() {
-                parts.push(format!(
-                    "'{}' is a mainland Chinese expression; Taiwan standard: {}.",
-                    issue.found,
-                    issue.suggestions.join(" / "),
-                ));
-            }
-        }
-        IssueType::Confusable => {
-            if let Some(eng) = &issue.english {
-                parts.push(format!(
-                    "'{}' is ambiguous across the strait. English anchor: '{}'. Taiwan form: {}.",
-                    issue.found,
-                    eng,
-                    issue.suggestions.join(" / "),
-                ));
-            }
-        }
-        IssueType::PoliticalColoring => {
-            parts.push(format!(
-                "'{}' carries mainland political connotations; prefer {}.",
-                issue.found,
-                issue.suggestions.join(" / "),
-            ));
-        }
-        IssueType::Variant => {
-            parts.push(format!(
-                "'{}' is a non-standard character variant; MoE standard form: {}.",
-                issue.found,
-                issue.suggestions.join(" / "),
-            ));
-        }
-        IssueType::Typo => {
-            parts.push(format!(
-                "'{}' appears to be a typo; suggested: {}.",
-                issue.found,
-                issue.suggestions.join(" / "),
-            ));
-        }
-        IssueType::Case => {
-            parts.push(format!(
-                "'{}' has incorrect casing; standard form: {}.",
-                issue.found,
-                issue.suggestions.join(" / "),
-            ));
-        }
-        IssueType::Punctuation => {
-            parts.push(format!(
-                "'{}' should use the full-width equivalent {} in CJK prose per MoE standards.",
-                issue.found,
-                issue.suggestions.join(" / "),
-            ));
-        }
-        IssueType::Grammar => {
-            if let Some(ctx) = &issue.context {
-                parts.push(format!(
-                    "'{}' — {}. Suggested: {}.",
-                    issue.found,
-                    ctx,
-                    issue.suggestions.join(" / "),
-                ));
-            } else {
-                parts.push(format!(
-                    "'{}' is a grammatical issue; suggested: {}.",
-                    issue.found,
-                    issue.suggestions.join(" / "),
-                ));
-            }
-        }
-        IssueType::AiStyle => {
-            if let Some(ctx) = &issue.context {
-                parts.push(format!("'{}' — {}.", issue.found, ctx));
-            }
-
-            // Read the suggestions directly rather than the derived
-            // suggested_rewrite field, so a stale derivation cannot change what
-            // the reader is told.
-            match &*issue.suggestions {
-                // Advice only: the context already says what to do, and telling
-                // a reader to remove an unsourced attribution would delete the
-                // claim rather than source it.
-                [] => {}
-                [one] if !one.is_empty() => parts.push(format!("Suggested rewrite: {one}.")),
-                all if all.iter().any(|s| !s.is_empty()) => parts.push(
-                    "Rewrite the surrounding clause; do not choose an alternative mechanically."
-                        .to_string(),
-                ),
-                _ => parts.push("Consider removing or rephrasing.".to_string()),
-            }
-        }
-        IssueType::Translationese => {
-            if let Some(ctx) = &issue.context {
-                parts.push(format!("'{}' — {}.", issue.found, ctx));
-            }
-            if !issue.suggestions.is_empty() {
-                let sugg = issue.suggestions.join(" / ");
-                parts.push(format!("Suggested rewrite: {sugg}."));
-            } else {
-                parts.push(
-                    "Translationese / 歐化 pattern; consider an idiomatic zh-TW rewrite."
-                        .to_string(),
-                );
-            }
-        }
-        IssueType::Repetition => {
-            if is_spaced_acronym_issue(issue) {
-                parts.push(format!(
-                    "'{}' should be written as '{}'; the spacing looks like a transcription artifact.",
-                    issue.found,
-                    issue.suggestions[0],
-                ));
-            } else {
-                parts.push(format!(
-                    "'{}' is a consecutive duplicate; remove the repetition.",
-                    issue.found,
-                ));
-            }
-        }
-    }
-
-    // Grammar, AiStyle, and Translationese issues already embed context in the
-    // main explanation; skip the shared Context: append to avoid duplication.
-    if !matches!(
-        issue.rule_type,
-        IssueType::Grammar | IssueType::AiStyle | IssueType::Translationese
-    ) {
-        if let Some(ctx) = &issue.context {
-            parts.push(format!("Context: {ctx}"));
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
-}
-
-/// Parse the optional "ignore_terms" array from tool arguments.
-fn parse_ignore_terms(args: &Value) -> Vec<String> {
-    args.get("ignore_terms")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Parse the optional `glossary` object.  Shape:
-/// `{ "banned": [...], "preferred": [...], "proper_nouns": [...] }`.
-/// Each field is optional.  Missing object → empty glossary.
-fn parse_glossary(args: &Value) -> crate::rules::glossary::ProjectGlossary {
-    fn array_of_strings(v: Option<&Value>) -> Vec<String> {
-        v.and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-    let Some(glossary) = args.get("glossary").and_then(|v| v.as_object()) else {
-        return crate::rules::glossary::ProjectGlossary::default();
-    };
-    crate::rules::glossary::ProjectGlossary {
-        banned: array_of_strings(glossary.get("banned")),
-        preferred: array_of_strings(glossary.get("preferred")),
-        proper_nouns: array_of_strings(glossary.get("proper_nouns")),
-    }
-}
-
 /// Remove political_coloring issues that the given stance suppresses.
 fn filter_by_stance(issues: &mut Vec<Issue>, stance: PoliticalStance) {
     issues.retain(|issue| {
@@ -1438,524 +875,53 @@ fn filter_by_stance(issues: &mut Vec<Issue>, stance: PoliticalStance) {
     });
 }
 
-/// Issue severity summary counts.
-#[derive(Serialize)]
-struct IssueSummary {
-    errors: usize,
-    warnings: usize,
-    info: usize,
-    /// Number of issues downgraded to Info by translation memory.
-    /// Omitted (0) when TM is inactive or had no effect.
-    #[serde(skip_serializing_if = "is_zero")]
-    tm_suppressed: usize,
-    /// Issues resolved by Tier 2 local disambiguation (context clues,
-    /// profile priors, collocations).  Omitted (0) when Tier 2 had no effect.
-    #[serde(skip_serializing_if = "is_zero")]
-    tier2_resolved: usize,
-    /// Issues in Tier 2 gray zone (forwarded to Tier 3 LLM).
-    #[serde(skip_serializing_if = "is_zero")]
-    tier2_gray_zone: usize,
-    /// Number of sampling calls made during this invocation.
-    /// Omitted (0) when sampling is inactive or unused.
-    #[serde(skip_serializing_if = "is_zero")]
-    sampling_used: usize,
-    /// Number of eligible issues skipped because the sampling budget was
-    /// exhausted.
-    /// Omitted (0) when budget was not exhausted.
-    #[serde(skip_serializing_if = "is_zero")]
-    sampling_skipped: usize,
-}
-
-fn is_zero(n: &usize) -> bool {
-    *n == 0
-}
-
-/// Resolution tier counts and confidence distribution for the session.
-/// Included in tool output when `include_stats` is true.
-#[derive(Serialize)]
-struct SummaryMetrics {
-    deterministic_fixes: usize,
-    heuristic_fixes: usize,
-    llm_judged_fixes: usize,
-    unresolved: usize,
-    llm_calls: usize,
-    llm_tokens: u64,
-    confidence_distribution: ConfidenceDistribution,
-}
-
-/// Confidence buckets: high (deterministic + heuristic), medium (llm_judged),
-/// low (unresolved).
-#[derive(Serialize)]
-struct ConfidenceDistribution {
-    high: usize,
-    medium: usize,
-    low: usize,
-}
-
-/// Build summary_metrics from issues and accumulated stats.
-fn build_summary_metrics(
-    issues: &[Issue],
-    sampling_stats: &SamplingStats,
-    telemetry: Option<&TelemetryMetrics>,
-) -> SummaryMetrics {
-    let mut deterministic = 0usize;
-    let mut heuristic = 0usize;
-    let mut llm_judged = 0usize;
-    let mut unresolved = 0usize;
-
-    for issue in issues {
-        match ResolutionTier::classify(issue) {
-            ResolutionTier::Deterministic => deterministic += 1,
-            ResolutionTier::Heuristic => heuristic += 1,
-            ResolutionTier::LlmJudged => llm_judged += 1,
-            ResolutionTier::Unresolved => unresolved += 1,
-        }
-    }
-
-    let llm_tokens = telemetry.map_or(0, |t| {
-        t.raw
-            .estimated_prompt_tokens
-            .saturating_add(t.raw.estimated_completion_tokens)
-    });
-
-    SummaryMetrics {
-        deterministic_fixes: deterministic,
-        heuristic_fixes: heuristic,
-        llm_judged_fixes: llm_judged,
-        unresolved,
-        llm_calls: sampling_stats.used,
-        llm_tokens,
-        confidence_distribution: ConfidenceDistribution {
-            high: deterministic + heuristic,
-            medium: llm_judged,
-            low: unresolved,
-        },
-    }
-}
-
-/// Gate status in the tool response.
-#[derive(Serialize)]
-struct GateInfo {
-    enabled: bool,
-    max_errors: usize,
-    residual_errors: usize,
-    max_warnings: usize,
-    residual_warnings: usize,
-}
-
-/// Anchor provenance for explain mode (borrowed).
-#[derive(Serialize)]
-struct AnchorProvenance<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    anchor_en: Option<&'a str>,
-    anchor_match: Option<bool>,
-}
-
 // EditorialConfidence is canonical-defined in crate::rules::ruleset so that
 // SpellingRule.editorial_confidence and the per-issue field share a single
 // type. Re-exported here for the explain pipeline.
 use crate::rules::ruleset::EditorialConfidence;
 
-/// Structured per-issue explain metadata.
-///
-/// Surfaced only when `explain` is requested.  Helps reviewers understand
-/// the confidence behind each suggestion without parsing free-form prose.
-#[derive(Serialize)]
-struct ExplainMeta<'a> {
-    /// Why this is flagged.  Sourced from rule context + MoE refs when
-    /// available; falls back to a structured restatement of the
-    /// suggestion target.
-    rationale: String,
-    /// Domain that triggered the rule.  Parsed from `@domain X` markers
-    /// in the rule's context field; defaults to "general".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    domain: Option<&'a str>,
-    /// True when the surface form is identical across zh-CN and zh-TW
-    /// but the meaning differs (e.g. 文件: document vs file).
-    is_false_friend: bool,
-    /// Whether `--fix` would safely apply this suggestion.
-    auto_fix_safe: bool,
-    /// Whether the suggestion benefits from manual review.
-    needs_review: bool,
-    /// Per-issue editorial confidence: distinguishes binary corrections
-    /// from style preferences (e.g. 場景 is correct zh-TW for a film or
-    /// stage scene, so rewriting it to 情境 is an IT-context judgment call,
-    /// whereas 線程 to 執行緒 is simply the zh-TW term).
-    editorial_confidence: EditorialConfidence,
-}
-
-/// Heuristic fallback when an issue lacks a rule-level
-/// `editorial_confidence`.  Translationese / AI-style / grammar hits and
-/// any `Info`-severity or anchor-rejected issue are surfaced as `Low`;
-/// hits with explicit context support climb to `Medium`; everything else
-/// is `High`.
-fn heuristic_editorial_confidence(issue: &Issue) -> EditorialConfidence {
-    use crate::rules::ruleset::{IssueType, Severity};
-
-    let always_low = matches!(
-        issue.rule_type,
-        IssueType::Translationese | IssueType::AiStyle | IssueType::Grammar
-    ) || issue.severity == Severity::Info
-        || issue.anchor_match == Some(false);
-    if always_low {
-        return EditorialConfidence::Low;
-    }
-    if issue.context_clues.is_some() || issue.anchor_match == Some(true) {
-        EditorialConfidence::Medium
-    } else {
-        EditorialConfidence::High
-    }
-}
-
-/// Derive structured explain metadata for an issue.
-///
-/// Confidence resolution order:
-///   1. Honor `issue.editorial_confidence` if the rule annotated it
-///      (set in `assets/ruleset.json` per-rule).
-///   2. Otherwise, fall back to heuristics on rule type / severity /
-///      anchor_match / context_clues.
-///
-/// Invariants: `editorial_confidence == Low` ⇒ `auto_fix_safe = false`
-/// AND `needs_review = true`.
-fn derive_explain_meta(issue: &Issue) -> ExplainMeta<'_> {
-    use crate::rules::ruleset::IssueType;
-
-    // -- Domain extraction from "@domain X" markers in the rule context.
-    let domain = issue.context.as_deref().and_then(|c| {
-        let needle = "@domain ";
-        c.find(needle).map(|i| {
-            let rest = &c[i + needle.len()..];
-            // Take up to the first whitespace, full-width comma, or period.
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '\u{FF0C}' || c == '\u{3002}')
-                .unwrap_or(rest.len());
-            rest[..end].trim()
-        })
-    });
-
-    // -- Editorial confidence. Rule-level annotation wins (from
-    // assets/ruleset.json editorial_confidence); else heuristics on rule type /
-    // severity / anchor_match / context_clues.
-    let editorial_confidence = issue
-        .editorial_confidence
-        .unwrap_or_else(|| heuristic_editorial_confidence(issue));
-
-    // -- False-friend detection. Confusable rules are the canonical false
-    // friends. Rule-tagged low-confidence terms are also surfaced as false
-    // friends because their surface form is shared across regions with
-    // divergent senses.
-    let is_false_friend = matches!(issue.rule_type, IssueType::Confusable)
-        || matches!(editorial_confidence, EditorialConfidence::Low)
-            && issue.editorial_confidence.is_some();
-
-    // -- Auto-fix safety + review need. Invariant: low confidence forces
-    // auto_fix_safe=false + needs_review=true. Otherwise punctuation / case /
-    // variant / typo hits with a single suggestion are auto-fix safe.
-    let single_unambiguous = issue.suggestions.len() == 1
-        && matches!(
-            issue.rule_type,
-            IssueType::Punctuation | IssueType::Case | IssueType::Variant | IssueType::Typo
-        );
-
-    let auto_fix_safe =
-        !matches!(editorial_confidence, EditorialConfidence::Low) && single_unambiguous;
-
-    let needs_review = matches!(editorial_confidence, EditorialConfidence::Low)
-        || issue.suggestions.len() > 1
-        || matches!(
-            issue.rule_type,
-            IssueType::Translationese | IssueType::AiStyle | IssueType::Grammar
-        );
-
-    let rationale = build_explanation(issue)
-        .unwrap_or_else(|| format!("'{}' flagged by {:?} rule.", issue.found, issue.rule_type));
-
-    ExplainMeta {
-        rationale,
-        domain,
-        is_false_friend,
-        auto_fix_safe,
-        needs_review,
-        editorial_confidence,
-    }
-}
-
-/// Anchor provenance for compact mode (owned).
-#[derive(Serialize)]
-struct AnchorProvenanceOwned {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    anchor_en: Option<String>,
-    anchor_match: Option<bool>,
-}
-
-/// Issue with optional explain/stats annotations, serialized directly without
-/// intermediate Value allocation.
-#[derive(Serialize)]
-struct AnnotatedIssue<'a> {
-    #[serde(flatten)]
-    issue: &'a Issue,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    explanation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    anchor_provenance: Option<AnchorProvenance<'a>>,
-    /// Structured per-issue explain metadata.  Present only in
-    /// explain mode.  Carries domain, false-friend flag, auto-fix
-    /// safety, review burden, and editorial confidence.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    explain_meta: Option<ExplainMeta<'a>>,
-    /// Resolution tier: which pipeline stage authored this issue's resolution.
-    /// Present only when `include_stats` is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolution: Option<ResolutionTier>,
-}
-
-/// Issues list: either plain references or annotated wrappers.
-#[derive(Serialize)]
-#[serde(untagged)]
-enum IssuesList<'a> {
-    Plain(&'a [Issue]),
-    Annotated(Vec<AnnotatedIssue<'a>>),
-}
-
-/// Location in compact mode.
-#[derive(Serialize)]
-struct CompactLocation {
-    line: usize,
-    col: usize,
-}
-
-/// Calibration stats from translation verification.
-#[cfg(feature = "translate")]
-#[derive(Serialize)]
-struct VerifyStats {
-    api_ok: bool,
-    matched: usize,
-    unmatched: usize,
-    no_english: usize,
-}
-
-/// Full-detail tool response (serialized directly, no intermediate Value).
-#[derive(Serialize)]
-struct FullOutput<'a> {
-    accepted: bool,
+/// What one request counted, gathered from the stages that produced it.
+/// These six always travel together, from the pipeline that fills them to
+/// the single struct that reads them, so they arrive as one binding rather
+/// than as a signature at clippy's argument limit.
+struct TelemetryCounts<'a> {
     text: &'a str,
-    issues: IssuesList<'a>,
+    scanner_hit_count: usize,
+    disambig_stats: &'a DisambigStats,
+    sampling_stats: &'a SamplingStats,
+    /// Prompt and completion tokens the sampling bridge estimated, zero when
+    /// no sampling ran.  Read off the bridge at the call site rather than
+    /// held here: the bridge carries three lifetimes of its own, and a struct
+    /// that named them would tie them to every other borrow in this one.
+    est_tokens: (u64, u64),
     applied_fixes: usize,
-    summary: &'a IssueSummary,
-    gate: GateInfo,
-    profile: &'a str,
-    political_stance: &'a str,
-    detected_script: &'a str,
-    s2t_applied: bool,
-    trace: &'a Trace,
-    /// Present when fix_output != "full": indicates the `text` field contains
-    /// a diff representation (search_replace blocks or patch JSON) instead of
-    /// the full corrected text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fix_output_mode: Option<&'a str>,
-    #[cfg(feature = "translate")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verify: Option<VerifyStats>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<&'a crate::engine::scan::CoverageReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oral_density: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quality_flags: Option<&'a [String]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ai_signature: Option<&'a crate::engine::ai_score::AiSignatureReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    translationese_signature: Option<&'a crate::engine::translationese_score::TranslationeseReport>,
-    /// Composite three-axis style scorecard.  Present when the caller
-    /// opts in via `detect_style: true` (the MCP equivalent of the CLI
-    /// `--detect-style` shorthand).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    style_scorecard: Option<&'a crate::engine::style_score::StyleScorecard>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    telemetry: Option<&'a TelemetryMetrics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary_metrics: Option<&'a SummaryMetrics>,
-    /// Document-wide consistency report.  Present only when the
-    /// caller passed `consistency: true` AND mixed regional usage
-    /// (both `線程` and `執行緒`, etc.) is detected in the document.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    consistency: Option<&'a crate::engine::consistency::ConsistencyReport>,
 }
 
-/// Compact tool response (serialized directly, no intermediate Value).
-#[derive(Serialize)]
-struct CompactOutput<'a> {
-    accepted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-    issues: Vec<CompactGroup>,
-    applied_fixes: usize,
-    summary: &'a IssueSummary,
-    gate: GateInfo,
-    profile: &'a str,
-    detected_script: &'a str,
-    s2t_applied: bool,
-    /// Present when fix_output != "full": indicates the `text` field contains
-    /// a diff representation instead of the full corrected text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fix_output_mode: Option<&'a str>,
-    #[cfg(feature = "translate")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verify: Option<VerifyStats>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<&'a crate::engine::scan::CoverageReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oral_density: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quality_flags: Option<&'a [String]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ai_signature: Option<&'a crate::engine::ai_score::AiSignatureReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    translationese_signature: Option<&'a crate::engine::translationese_score::TranslationeseReport>,
-    /// Composite three-axis style scorecard.  Present when the caller
-    /// opts in via `detect_style: true` (the MCP equivalent of the CLI
-    /// `--detect-style` shorthand).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    style_scorecard: Option<&'a crate::engine::style_score::StyleScorecard>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    telemetry: Option<&'a TelemetryMetrics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary_metrics: Option<&'a SummaryMetrics>,
-}
-
-/// Summary-only output: issue counts + AI signature, no individual issues or
-/// text.
-#[derive(Serialize)]
-struct SummaryOutput<'a> {
-    accepted: bool,
-    summary: &'a IssueSummary,
-    gate: GateInfo,
-    profile: &'a str,
-    detected_script: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<&'a crate::engine::scan::CoverageReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oral_density: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quality_flags: Option<&'a [String]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ai_signature: Option<&'a crate::engine::ai_score::AiSignatureReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    translationese_signature: Option<&'a crate::engine::translationese_score::TranslationeseReport>,
-    /// Composite three-axis style scorecard.  Present when the caller
-    /// opts in via `detect_style: true` (the MCP equivalent of the CLI
-    /// `--detect-style` shorthand).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    style_scorecard: Option<&'a crate::engine::style_score::StyleScorecard>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    telemetry: Option<&'a TelemetryMetrics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary_metrics: Option<&'a SummaryMetrics>,
-}
-
-/// Count issues by severity.
-fn build_summary(
-    issues: &[Issue],
-    tm_suppressed: usize,
-    sampling_stats: SamplingStats,
-    disambig_stats: &DisambigStats,
-) -> IssueSummary {
-    let mut s = IssueSummary {
-        errors: 0,
-        warnings: 0,
-        info: 0,
-        tm_suppressed,
-        tier2_resolved: disambig_stats.tier2_resolved,
-        tier2_gray_zone: disambig_stats.gray_zone,
-        sampling_used: sampling_stats.used,
-        sampling_skipped: sampling_stats.skipped,
-    };
-    for issue in issues {
-        match issue.severity {
-            Severity::Error => s.errors += 1,
-            Severity::Warning => s.warnings += 1,
-            Severity::Info => s.info += 1,
-        }
-    }
-    s
-}
-
-/// Parameters for build_check_output.
-struct CheckOutputParams<'a> {
-    result_text: &'a str,
-    issues: &'a [Issue],
-    applied_fixes: usize,
-    max_errors: Option<u64>,
-    max_warnings: Option<u64>,
-    profile: Profile,
-    stance_name: &'a str,
-    detected_script: &'a str,
-    /// Whether S2T conversion was applied (input was Simplified Chinese).
-    s2t_applied: bool,
-    trace: &'a Trace,
-    explain: bool,
-    output_mode: OutputMode,
-    has_fixes: bool,
-    /// Fix output mode: full text, search/replace blocks, or patch array.
-    fix_output: FixOutputMode,
-    /// Original text before fixes (needed for search_replace and patch modes).
-    original_text: &'a str,
-    /// Applied fix records for patch/search_replace output.
-    fix_records: &'a [crate::fixer::AppliedFix],
-    #[cfg(feature = "translate")]
-    calibrate_result: Option<crate::engine::translate::CalibrateResult>,
-    coverage: Option<&'a crate::engine::scan::CoverageReport>,
-    oral_density: Option<f32>,
-    quality_flags: &'a [String],
-    ai_signature: Option<&'a crate::engine::ai_score::AiSignatureReport>,
-    translationese_signature: Option<&'a crate::engine::translationese_score::TranslationeseReport>,
-    /// Composite style scorecard (or `None` when not requested).
-    /// The caller computes this once per scan; build_check_output forwards
-    /// it untouched into the chosen output mode.
-    style_scorecard: Option<&'a crate::engine::style_score::StyleScorecard>,
-    /// Number of issues downgraded by translation memory.
-    tm_suppressed: usize,
-    /// Sampling budget usage statistics.
-    sampling_stats: SamplingStats,
-    /// Tier 2 disambiguation statistics.
-    disambig_stats: DisambigStats,
-    /// Token telemetry metrics (only when include_telemetry is true).
-    telemetry: Option<TelemetryMetrics>,
-    /// Whether to include per-issue resolution tier and summary_metrics.
-    include_stats: bool,
-    /// Document-wide consistency report.  Some only when the
-    /// caller requested `consistency: true` AND mixed regional usage
-    /// is detected.
-    consistency: Option<&'a crate::engine::consistency::ConsistencyReport>,
+/// The token estimate a sampling bridge accumulated, or zeroes without one.
+fn est_tokens(bridge: Option<&&mut SamplingBridge<'_>>) -> (u64, u64) {
+    bridge
+        .map(|b| (b.est_prompt_tokens, b.est_completion_tokens))
+        .unwrap_or((0, 0))
 }
 
 /// Build telemetry metrics from accumulated counters.
 /// `cache_counts` is (hits, misses) from the judgment cache.
-fn build_telemetry(
-    text: &str,
-    scanner_hit_count: usize,
-    disambig_stats: &DisambigStats,
-    sampling_stats: &SamplingStats,
-    bridge: Option<&&mut SamplingBridge<'_>>,
-    applied_fixes: usize,
-    cache_counts: (u64, u64),
-) -> TelemetryMetrics {
-    let (est_prompt_tokens, est_completion_tokens) = bridge
-        .map(|b| (b.est_prompt_tokens, b.est_completion_tokens))
-        .unwrap_or((0, 0));
+fn build_telemetry(counts: TelemetryCounts<'_>, cache_counts: (u64, u64)) -> TelemetryMetrics {
+    let (est_prompt_tokens, est_completion_tokens) = counts.est_tokens;
 
     // ambiguous_terms: all terms that entered Tier 2 evaluation (resolved +
     // suppressed + gray_zone), not just those forwarded to Tier 3.
+    let disambig_stats = counts.disambig_stats;
     let ambiguous_terms = (disambig_stats.tier2_resolved
         + disambig_stats.suppressed
         + disambig_stats.gray_zone) as u64;
     let t = TokenTelemetry {
-        input_chars: text.chars().count() as u64,
-        rule_hits: scanner_hit_count as u64,
+        input_chars: counts.text.chars().count() as u64,
+        rule_hits: counts.scanner_hit_count as u64,
         ambiguous_terms,
         tier2_resolved: disambig_stats.tier2_resolved as u64,
-        llm_round_trips: sampling_stats.used as u64,
-        final_fixes: applied_fixes as u64,
+        llm_round_trips: counts.sampling_stats.used as u64,
+        final_fixes: counts.applied_fixes as u64,
         prompt_tokens: est_prompt_tokens,
         completion_tokens: est_completion_tokens,
         cache_hits: cache_counts.0,
@@ -1964,15 +930,19 @@ fn build_telemetry(
     t.derive_metrics()
 }
 
-/// Build the unified zhtw JSON response and wrap it in a CallToolResult.
-///
-/// Both the lint-only and fix paths produce the same output shape; only the
-/// concrete values differ. Compact mode omits text (in lint-only), trace,
-/// byte offsets/lengths, and deduplicates repeated issues.
-///
-/// Serializes typed structs directly to avoid intermediate `serde_json::Value`
-/// allocations. Uses compact JSON by default; set `ZHTW_PRETTY=1` env var
-/// for indented output during debugging.
+/// What [Server::reconcile_rescan] needs to bring a re-scan back in line with
+/// the request. Seven values the fix path already holds, handed over as one
+/// binding rather than as a signature at clippy's argument limit.
+struct RescanContext<'a> {
+    stance: Option<PoliticalStance>,
+    ignore_set: &'a std::collections::HashSet<&'a str>,
+    preserved_states: &'a [PreservedState],
+    fix_result: &'a crate::fixer::FixResult,
+    content_type: ContentType,
+    cfg: &'a crate::rules::ruleset::ProfileConfig,
+    glossary: &'a crate::rules::glossary::ProjectGlossary,
+}
+
 /// Inputs to [Server::run_scan_stage], which both `fix_mode` paths share.
 /// Everything `tool_check`'s prologue settled, handed to whichever pipeline
 /// runs. Both pipelines need nearly all of it, so this is one binding instead
@@ -2041,6 +1011,7 @@ struct CheckFlags<'a> {
     register: Option<&'a str>,
     ai_threshold: Option<&'a str>,
     rhythm: bool,
+    spacing: Option<&'a str>,
     off: &'a [crate::rules::ruleset::RuleFamily],
 }
 
@@ -2094,6 +1065,12 @@ fn build_check_config(
     if flags.rhythm {
         cfg = cfg.with_rhythm(true);
     }
+    if let Some(policy) = flags.spacing {
+        match crate::rules::ruleset::SpacingPolicy::from_str_strict(policy) {
+            Some(policy) => cfg = cfg.with_spacing_policy(policy),
+            None => return Err(enum_param_error("spacing", policy)),
+        }
+    }
 
     // Resolve effective AI detection: explicit arg wins over profile default.
     // All four AI sub-flags move as a unit: enabling detection turns them all
@@ -2145,833 +1122,10 @@ fn style_scorecard_for(
     ))
 }
 
-fn build_check_output(params: &CheckOutputParams<'_>) -> CallToolResult {
-    let summary = build_summary(
-        params.issues,
-        params.tm_suppressed,
-        params.sampling_stats,
-        &params.disambig_stats,
-    );
-
-    let stats_metrics = if params.include_stats {
-        Some(build_summary_metrics(
-            params.issues,
-            &params.sampling_stats,
-            params.telemetry.as_ref(),
-        ))
-    } else {
-        None
-    };
-
-    let max_err = params.max_errors.unwrap_or(0) as usize;
-    let max_warn = params.max_warnings.unwrap_or(0) as usize;
-    let gate_enabled = params.max_errors.is_some() || params.max_warnings.is_some();
-    let accepted = params.max_errors.is_none_or(|_| summary.errors <= max_err)
-        && params
-            .max_warnings
-            .is_none_or(|_| summary.warnings <= max_warn);
-
-    let gate = GateInfo {
-        enabled: gate_enabled,
-        max_errors: max_err,
-        residual_errors: summary.errors,
-        max_warnings: max_warn,
-        residual_warnings: summary.warnings,
-    };
-
-    #[cfg(feature = "translate")]
-    let verify = params.calibrate_result.as_ref().map(|cr| VerifyStats {
-        api_ok: cr.api_ok,
-        matched: cr.matched,
-        unmatched: cr.unmatched,
-        no_english: cr.no_english,
-    });
-
-    // When fix_output is not Full and fixes were applied, replace the text
-    // field with a diff representation to save output tokens.
-    let diff_text: Option<String> = if params.has_fixes
-        && params.fix_output != FixOutputMode::Full
-        && !params.fix_records.is_empty()
-    {
-        Some(build_fix_diff(
-            params.original_text,
-            params.fix_records,
-            params.fix_output,
-        ))
-    } else {
-        None
-    };
-    let effective_text = diff_text.as_deref().unwrap_or(params.result_text);
-
-    let fix_mode_label = if diff_text.is_some() {
-        Some(params.fix_output.name())
-    } else {
-        None
-    };
-    let quality_flags = (!params.quality_flags.is_empty()).then_some(params.quality_flags);
-
-    let serialize_result = match params.output_mode {
-        OutputMode::Full => {
-            let issues = build_issues_list(params.issues, params.explain, params.include_stats);
-            let output = FullOutput {
-                accepted,
-                text: effective_text,
-                issues,
-                applied_fixes: params.applied_fixes,
-                summary: &summary,
-                gate,
-                profile: params.profile.name(),
-                political_stance: params.stance_name,
-                detected_script: params.detected_script,
-                s2t_applied: params.s2t_applied,
-                trace: params.trace,
-                fix_output_mode: fix_mode_label,
-                #[cfg(feature = "translate")]
-                verify,
-                coverage: params.coverage,
-                oral_density: params.oral_density,
-                quality_flags,
-                ai_signature: params.ai_signature,
-                translationese_signature: params.translationese_signature,
-                style_scorecard: params.style_scorecard,
-                telemetry: params.telemetry.as_ref(),
-                summary_metrics: stats_metrics.as_ref(),
-                consistency: params.consistency,
-            };
-            serialize_output(&output)
-        }
-        OutputMode::Compact => {
-            let issues = build_compact_groups(params.issues, params.explain, params.include_stats);
-            let output = CompactOutput {
-                accepted,
-                text: if params.has_fixes {
-                    Some(effective_text)
-                } else {
-                    None
-                },
-                issues,
-                applied_fixes: params.applied_fixes,
-                summary: &summary,
-                gate,
-                profile: params.profile.name(),
-                detected_script: params.detected_script,
-                s2t_applied: params.s2t_applied,
-                fix_output_mode: fix_mode_label,
-                #[cfg(feature = "translate")]
-                verify,
-                coverage: params.coverage,
-                oral_density: params.oral_density,
-                quality_flags,
-                ai_signature: params.ai_signature,
-                translationese_signature: params.translationese_signature,
-                style_scorecard: params.style_scorecard,
-                telemetry: params.telemetry.as_ref(),
-                summary_metrics: stats_metrics.as_ref(),
-            };
-            serialize_output(&output)
-        }
-        OutputMode::Tabular => {
-            let tsv = build_tabular_output(
-                accepted,
-                params.issues,
-                params.applied_fixes,
-                &summary,
-                params.has_fixes,
-                effective_text,
-                params.explain,
-                fix_mode_label,
-            );
-            Ok(tsv)
-        }
-        OutputMode::Summary => {
-            let output = SummaryOutput {
-                accepted,
-                summary: &summary,
-                gate,
-                profile: params.profile.name(),
-                detected_script: params.detected_script,
-                coverage: params.coverage,
-                oral_density: params.oral_density,
-                quality_flags,
-                ai_signature: params.ai_signature,
-                translationese_signature: params.translationese_signature,
-                style_scorecard: params.style_scorecard,
-                telemetry: params.telemetry.as_ref(),
-                summary_metrics: stats_metrics.as_ref(),
-            };
-            serialize_output(&output)
-        }
-    };
-
-    match serialize_result {
-        Ok(json_str) => {
-            if accepted {
-                tool_text(json_str)
-            } else {
-                tool_error(json_str)
-            }
-        }
-        Err(e) => {
-            tracing::error!("failed to serialize check output: {e}");
-            tool_error("internal server error".into())
-        }
-    }
-}
-
-/// Serialize to compact JSON by default; pretty-print when `ZHTW_PRETTY=1`.
-fn serialize_output(output: &impl serde::Serialize) -> serde_json::Result<String> {
-    if std::env::var_os("ZHTW_PRETTY").is_some_and(|v| v == "1") {
-        serde_json::to_string_pretty(output)
-    } else {
-        serde_json::to_string(output)
-    }
-}
-
-/// Build issues list for full output mode: either plain references (no extra
-/// fields) or annotated wrappers with explanation, anchor provenance, and/or
-/// resolution tier.
-fn build_issues_list<'a>(
-    issues: &'a [Issue],
-    explain: bool,
-    include_stats: bool,
-) -> IssuesList<'a> {
-    if explain || include_stats {
-        let annotated: Vec<AnnotatedIssue<'a>> = issues
-            .iter()
-            .map(|issue| {
-                let explanation = if explain {
-                    build_explanation(issue)
-                } else {
-                    None
-                };
-                let anchor_provenance = if explain && issue.anchor_match.is_some() {
-                    Some(AnchorProvenance {
-                        anchor_en: issue.english.as_deref(),
-                        anchor_match: issue.anchor_match,
-                    })
-                } else {
-                    None
-                };
-                let resolution = if include_stats {
-                    Some(ResolutionTier::classify(issue))
-                } else {
-                    None
-                };
-                let explain_meta = if explain {
-                    Some(derive_explain_meta(issue))
-                } else {
-                    None
-                };
-                AnnotatedIssue {
-                    issue,
-                    explanation,
-                    anchor_provenance,
-                    explain_meta,
-                    resolution,
-                }
-            })
-            .collect();
-        IssuesList::Annotated(annotated)
-    } else {
-        IssuesList::Plain(issues)
-    }
-}
-
-/// Build compact deduplicated issues array.
-///
-/// Groups issues by (found, rule_type, suggestions, severity) key. Each group
-/// becomes one entry with count and locations. Serialized directly via
-/// `#[derive(Serialize)]` on `CompactGroup`: no intermediate `Value` per
-/// group.
-fn build_compact_groups(issues: &[Issue], explain: bool, include_stats: bool) -> Vec<CompactGroup> {
-    use std::collections::BTreeMap;
-
-    // Key: (found, rule_type, suggestions_joined, severity,
-    // resolution_tier_discriminant) Include severity so that sampling can
-    // produce mixed-severity occurrences of the same term without silently
-    // inheriting the first occurrence's level. When include_stats is true, also
-    // partition by resolution tier so the per-group resolution field is
-    // accurate. Uses shared IssueType::name() and Severity::name() from
-    // ruleset.rs. We use BTreeMap for deterministic ordering.
-    let mut groups: BTreeMap<(&str, &str, String, &str, u8), CompactGroup> = BTreeMap::new();
-
-    for issue in issues {
-        let rt = issue.rule_type.name();
-        let sug_key = issue.suggestions.join("|");
-        let sev_key = issue.severity.name();
-
-        // Compute resolution tier once; reuse for both grouping key and field
-        // value. Discriminant 0 when stats disabled (all group together);
-        // distinct per-tier when enabled so the resolution field stays
-        // accurate.
-        let tier = if include_stats {
-            Some(ResolutionTier::classify(issue))
-        } else {
-            None
-        };
-        let tier_disc = tier.map_or(0, |t| t as u8 + 1);
-        let key = (issue.found.as_str(), rt, sug_key, sev_key, tier_disc);
-
-        let group = groups.entry(key).or_insert_with(|| CompactGroup {
-            found: issue.found.clone(),
-            suggestions: issue.suggestions.to_vec(),
-            suggested_rewrite: issue.suggested_rewrite.clone(),
-            rule_type: rt.to_string(),
-            severity: issue.severity.name().to_string(),
-            context: issue.context.as_deref().map(str::to_string),
-            english: issue.english.as_deref().map(str::to_string),
-            explanation: if explain {
-                build_explanation(issue)
-            } else {
-                None
-            },
-            anchor_provenance: if explain && issue.anchor_match.is_some() {
-                Some(AnchorProvenanceOwned {
-                    anchor_en: issue.english.as_deref().map(str::to_string),
-                    anchor_match: issue.anchor_match,
-                })
-            } else {
-                None
-            },
-            resolution: tier,
-            count: 0,
-            locations: Vec::new(),
-        });
-        group.count += 1;
-        group.locations.push(CompactLocation {
-            line: issue.line,
-            col: issue.col,
-        });
-    }
-
-    groups.into_values().collect()
-}
-
-/// Escape tab, newline, and carriage return in a TSV field to prevent
-/// column/row injection.  Returns a borrowed reference when no escaping
-/// is needed, avoiding allocation on the common path.
-pub fn escape_tsv_field(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.bytes()
-        .any(|b| b == b'\\' || b == b'\t' || b == b'\n' || b == b'\r')
-    {
-        let mut out = String::with_capacity(s.len());
-        for ch in s.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '\t' => out.push_str("\\t"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                _ => out.push(ch),
-            }
-        }
-        std::borrow::Cow::Owned(out)
-    } else {
-        std::borrow::Cow::Borrowed(s)
-    }
-}
-
-/// Deduplicated issue group shared by MCP tabular output and CLI tabular
-/// format.
-///
-/// Groups issues by (found, rule_type, suggestions, severity) key. Each group
-/// stores shared fields once and collects per-occurrence locations.
-pub struct IssueGroup {
-    pub suggestions: Vec<String>,
-    pub count: usize,
-    pub locs: Vec<(usize, usize)>,
-    pub explanation: Option<String>,
-}
-
 /// Issue grouping key: (found, rule_type, suggestions_joined, severity).
 pub type IssueGroupKey<'a> = (&'a str, &'a str, String, &'a str);
 
-/// Group issues by (found, rule_type, suggestions, severity) into a BTreeMap
-/// for deterministic ordering. Optionally generates explanations per group.
-pub fn group_issues<'a>(
-    issues: &'a [Issue],
-    explain: bool,
-) -> std::collections::BTreeMap<IssueGroupKey<'a>, IssueGroup> {
-    use std::collections::BTreeMap;
-    let mut groups: BTreeMap<IssueGroupKey<'a>, IssueGroup> = BTreeMap::new();
-    for issue in issues {
-        let rt = issue.rule_type.name();
-        let sug_key = issue.suggestions.join("|");
-        let sev = issue.severity.name();
-        let key: IssueGroupKey<'a> = (issue.found.as_str(), rt, sug_key, sev);
-        let entry = groups.entry(key).or_insert_with(|| IssueGroup {
-            suggestions: issue.suggestions.to_vec(),
-            count: 0,
-            locs: Vec::new(),
-            explanation: if explain {
-                build_explanation(issue)
-            } else {
-                None
-            },
-        });
-        entry.count += 1;
-        entry.locs.push((issue.line, issue.col));
-    }
-    groups
-}
-
-/// Map full severity name to single-letter code for tabular output.
-pub fn shorten_severity(sev: &str) -> &str {
-    match sev {
-        "error" => "E",
-        "warning" => "W",
-        "info" => "I",
-        _ => sev,
-    }
-}
-
-/// Map full issue type name to abbreviated code for tabular output.
-pub fn shorten_type(rt: &str) -> &str {
-    match rt {
-        "political_coloring" => "pol",
-        "cross_strait" => "cs",
-        "typo" => "typo",
-        "confusable" => "cf",
-        "case" => "case",
-        "punctuation" => "punc",
-        "variant" => "v",
-        "grammar" => "gram",
-        _ => rt,
-    }
-}
-
-/// Compress a list of (line, col) locations into a compact string.
-///
-/// When all locations share the same column, emits "L1,L4,L7:C" instead of
-/// the verbose "1:C,4:C,7:C" form -- saves tokens on repeated issues.
-pub fn compress_locations(locs: &[(usize, usize)]) -> String {
-    use std::fmt::Write;
-    if locs.is_empty() {
-        return String::new();
-    }
-    if locs.len() == 1 {
-        return format!("{}:{}", locs[0].0, locs[0].1);
-    }
-    // Check if all columns are identical.
-    let first_col = locs[0].1;
-    if locs.iter().all(|(_, c)| *c == first_col) {
-        let mut s = String::new();
-        for (i, (line, _)) in locs.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            let _ = write!(s, "{line}");
-        }
-        let _ = write!(s, ":{first_col}");
-        s
-    } else {
-        locs.iter()
-            .map(|(l, c)| format!("{l}:{c}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-/// Build header-once TSV output for LLM-facing responses.
-///
-/// Eliminates JSON syntax tax: no repeated keys, braces, or quotes per issue.
-/// Header row defines column semantics; data rows are tab-separated.
-/// Achieves >=50% token reduction vs compact JSON on typical responses.
-#[allow(clippy::too_many_arguments)]
-fn build_tabular_output(
-    accepted: bool,
-    issues: &[Issue],
-    applied_fixes: usize,
-    summary: &IssueSummary,
-    has_fixes: bool,
-    result_text: &str,
-    explain: bool,
-    fix_output_mode: Option<&str>,
-) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::with_capacity(256);
-
-    // Meta line: key=value pairs, omitting zero-count fields to save tokens.
-    let _ = write!(out, "#ok={}", accepted);
-    if summary.errors > 0 {
-        let _ = write!(out, "\terr={}", summary.errors);
-    }
-    if summary.warnings > 0 {
-        let _ = write!(out, "\twarn={}", summary.warnings);
-    }
-    if summary.info > 0 {
-        let _ = write!(out, "\tinfo={}", summary.info);
-    }
-    if applied_fixes > 0 {
-        let _ = write!(out, "\tfix={}", applied_fixes);
-    }
-    if has_fixes {
-        let _ = write!(out, "\ttxt={}", result_text.len());
-    }
-    if let Some(mode) = fix_output_mode {
-        let _ = write!(out, "\tfix_fmt={mode}");
-    }
-    out.push('\n');
-
-    let groups = group_issues(issues, explain);
-
-    // Header row.
-    if explain {
-        out.push_str("found\tsug\ttype\tsev\tn\tloc\texpl\n");
-    } else {
-        out.push_str("found\tsug\ttype\tsev\tn\tloc\n");
-    }
-
-    // Data rows. Use abbreviated severity (E/W/I) and rule type codes
-    // (cs/cf/v/pol/typo/punc/case/gram) to reduce token count. Escape
-    // tab/newline in data fields to prevent TSV injection.
-    for ((found, rt, _, sev), group) in &groups {
-        let found_safe = escape_tsv_field(found);
-        let suggestions_str = group
-            .suggestions
-            .iter()
-            .map(|s| escape_tsv_field(s))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Map full group-key names to abbreviated codes directly, avoiding an
-        // O(groups*issues) scan that could also mismatch when the same found
-        // term appears in multiple groups.
-        let short_rt = shorten_type(rt);
-        let short_sev = shorten_severity(sev);
-
-        // Compress locations: if all share the same column, emit "L1,L4,L7:C"
-        // instead of "L1:C,L4:C,L7:C".
-        let locs_str = compress_locations(&group.locs);
-
-        let _ = write!(
-            out,
-            "{found_safe}\t{suggestions_str}\t{short_rt}\t{short_sev}\t{}\t{locs_str}",
-            group.count,
-        );
-        if explain {
-            out.push('\t');
-            if let Some(expl) = &group.explanation {
-                out.push_str(&escape_tsv_field(expl));
-            }
-        }
-        out.push('\n');
-    }
-
-    // If fixes were applied, append the fixed text after a separator.
-    if has_fixes {
-        out.push_str("#text\n");
-        out.push_str(result_text);
-    }
-
-    out
-}
-
-/// Build diff representation of fixes for token-efficient output.
-///
-/// For SearchReplace mode: emits <<<<<<< SEARCH / ======= REPLACE / >>>>>>> END
-/// blocks that LLMs can parse reliably without byte arithmetic.
-/// For Patch mode: emits a JSON patches array with byte offsets, sorted
-/// descending by offset so clients can apply in order without index shifting.
-fn build_fix_diff(
-    original_text: &str,
-    fix_records: &[crate::fixer::AppliedFix],
-    mode: FixOutputMode,
-) -> String {
-    match mode {
-        FixOutputMode::SearchReplace => {
-            let mut out = String::with_capacity(fix_records.len() * 80);
-            for fix in fix_records {
-                // Safe slice: get() returns None if offset/end are out of
-                // bounds or not on UTF-8 char boundaries.
-                if let Some(found) = original_text.get(fix.offset..fix.offset + fix.old_len) {
-                    out.push_str("<<<<<<< SEARCH\n");
-                    out.push_str(found);
-                    out.push_str("\n======= REPLACE\n");
-                    out.push_str(&fix.replacement);
-                    out.push_str("\n>>>>>>> END\n");
-                }
-            }
-            out
-        }
-        FixOutputMode::Patch => {
-            use std::fmt::Write;
-
-            // TSV patch format: header-once, sorted descending by offset so
-            // clients can apply in order without index shifting.
-            let mut patches: Vec<(usize, usize, &str, &str)> = fix_records
-                .iter()
-                .filter_map(|fix| {
-                    let found = original_text.get(fix.offset..fix.offset + fix.old_len)?;
-                    Some((fix.offset, fix.old_len, found, fix.replacement.as_str()))
-                })
-                .collect();
-            patches.sort_by_key(|p| std::cmp::Reverse(p.0));
-
-            let mut out = String::with_capacity(patches.len() * 40);
-            let _ = writeln!(out, "#patches={}", patches.len());
-            out.push_str("offset\tlength\tfound\treplacement\n");
-            for (offset, length, found, replacement) in &patches {
-                let _ = writeln!(
-                    out,
-                    "{offset}\t{length}\t{}\t{}",
-                    escape_tsv_field(found),
-                    escape_tsv_field(replacement),
-                );
-            }
-            out
-        }
-        FixOutputMode::Full => {
-            // Should never reach here; caller guards.
-            String::new()
-        }
-    }
-}
-
-/// Helper for compact mode issue grouping.
-#[derive(Serialize)]
-struct CompactGroup {
-    found: String,
-    suggestions: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suggested_rewrite: Option<String>,
-    rule_type: String,
-    severity: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    english: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    explanation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    anchor_provenance: Option<AnchorProvenanceOwned>,
-    /// Resolution tier for all issues in this group.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolution: Option<ResolutionTier>,
-    count: usize,
-    locations: Vec<CompactLocation>,
-}
-
 // Tool definitions (JSON Schema for zhtw)
-
-/// The properties of the `zhtw` tool's input schema.
-///
-/// Built once and shared, so what the tool advertises and what it accepts are
-/// the same list rather than two lists that have to be kept in step. They were
-/// two, and the accepted one was spelled out twice more, once per `translate`
-/// build, so adding a parameter meant editing three places and being told it
-/// was unknown if you missed one.
-fn input_schema() -> &'static std::sync::Arc<JsonObject> {
-    static SCHEMA: std::sync::OnceLock<std::sync::Arc<JsonObject>> = std::sync::OnceLock::new();
-    SCHEMA.get_or_init(|| {
-        let mut schema = JsonObject::new();
-        schema.insert("type".into(), json!("object"));
-        schema.insert(
-            "properties".into(),
-            Value::Object(input_schema_properties().clone()),
-        );
-        schema.insert("required".into(), json!(["text"]));
-        std::sync::Arc::new(schema)
-    })
-}
-
-/// The parameter names the schema declares, which is what the tool accepts.
-fn input_schema_properties() -> &'static JsonObject {
-    static PROPS: std::sync::OnceLock<JsonObject> = std::sync::OnceLock::new();
-    PROPS.get_or_init(|| {
-        let mut props = serde_json::Map::new();
-        props.insert("text".into(), json!({ "type": "string" }));
-        props.insert(
-            "fix_mode".into(),
-            json!({
-                "type": "string",
-                "enum": ["none", "orthographic", "lexical_safe", "lexical_contextual"]
-            }),
-        );
-        props.insert("max_errors".into(), json!({ "type": "integer" }));
-        props.insert("max_warnings".into(), json!({ "type": "integer" }));
-        props.insert("profile".into(), json!({
-                "type": "string",
-                "enum": ["base", "strict"],
-                "description": "Norm strictness: 'base' (default) or 'strict' (full MoE with character variants)"
-            }));
-        props.insert("relaxed".into(), json!({
-                "type": "boolean",
-                "description": "Capability flag for software UI strings: disables colon enforcement, dunhao detection, grammar checks; uses en-dash for ranges"
-            }));
-        props.insert("off".into(), json!({
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": crate::rules::ruleset::RuleFamily::ALL
-                        .iter()
-                        .map(|family| family.name())
-                        .collect::<Vec<_>>(),
-                },
-                "description": "Disable named rule families after the profile and capability flags resolve"
-            }));
-        props.insert("exempt_blockquotes".into(), json!({
-                "type": "boolean",
-                "description": "Markdown only: exclude pulldown-cmark `Tag::BlockQuote` ranges from scanning.  Useful when a document quotes mainland-Chinese sources for illustrative purposes.  Off by default."
-            }));
-        props.insert(
-            "content_type".into(),
-            json!({
-                "type": "string",
-                "default": "plain",
-                "enum": ["plain", "markdown", "markdown-scan-code", "yaml"]
-            }),
-        );
-        props.insert(
-            "political_stance".into(),
-            json!({
-                "type": "string",
-                "enum": ["roc_centric", "international", "neutral"]
-            }),
-        );
-        props.insert(
-            "ignore_terms".into(),
-            json!({
-                "type": "array",
-                "items": { "type": "string" }
-            }),
-        );
-        props.insert("glossary".into(), json!({
-                "type": "object",
-                "description": "Project-level glossary.  `banned` terms always fire (project-wide truth, banned > TM); `proper_nouns` suppress matching issues; `preferred` chooses canonical TW form for the consistency report.",
-                "properties": {
-                    "banned": { "type": "array", "items": { "type": "string" } },
-                    "preferred": { "type": "array", "items": { "type": "string" } },
-                    "proper_nouns": { "type": "array", "items": { "type": "string" } },
-                }
-            }));
-        props.insert("consistency".into(), json!({
-                "type": "boolean",
-                "description": "Emit a `consistency` block when both regional variants of one concept appear in the document (e.g. both 線程 and 執行緒).  Off by default."
-            }));
-        props.insert("explain".into(), json!({ "type": "boolean" }));
-        props.insert("fix_output".into(), json!({
-                "type": "string",
-                "enum": ["full", "search_replace", "patch"],
-                "description": "Fix output format: full text (default), search/replace blocks, or patch array with byte offsets"
-            }));
-        #[cfg(feature = "translate")]
-        props.insert(
-            "verify".into(),
-            json!({
-                "type": "boolean",
-                "description": "Anchor-verify issues via Google Translate. \
-Sends the sentences around each issue to Google. Off unless asked, and refused \
-when the server has ZHTW_NO_NETWORK set."
-            }),
-        );
-        props.insert("output".into(), json!({
-                "type": "string",
-                "enum": ["full", "compact", "tabular", "summary"],
-                "description": "Output mode. 'summary' returns only issue counts + AI signature (no individual issues)"
-            }));
-        props.insert("detect_ai".into(), json!({
-                "type": "boolean",
-                "description": "Enable AI writing artifact detection (density + grammar patterns). Default: on. Set false to suppress AI filler findings."
-            }));
-        props.insert("detect_translationese".into(), json!({
-                "type": "boolean",
-                "description": "Enable translationese (翻譯腔 / 歐化) detection — Europeanized syntax and calques from the dewesternise checklist. Default: on. Orthogonal to detect_ai; reported separately."
-            }));
-        props.insert("detect_style".into(), json!({
-                "type": "boolean",
-                "description": "Composite style scorecard: emit `style_scorecard` with three orthogonal axes (ai, translationese, regional_density) plus top contributing issues. Default: false. Three scores never collapsed into a single number."
-            }));
-        props.insert("translationese_domain".into(), json!({
-                "type": "string",
-                "enum": ["general", "technical", "literary", "news"],
-                "description": "Per-domain calibration for translationese scoring thresholds. 'technical' tolerates more passive voice and weak-verb nominalization; 'literary' is the strictest; 'news' favors active voice. Default: 'general'."
-            }));
-        props.insert("document_genre".into(), json!({
-                "type": "string",
-                "enum": ["casual", "technical", "financial"],
-                "description": "How strictly the document is held to sourcing, for unsupported authority attributions. Requires detect_ai. Distinct from the register parameter, which is a property of the prose and suppresses findings; this one only selects advice and never suppresses. Never suggests an edit: casual prose is advised to name the source or drop the appeal, technical and financial prose that the claim needs a citation. Default: casual."
-            }));
-        props.insert("register".into(), json!({
-                "type": "string",
-                "enum": ["auto", "formal", "casual"],
-                "description": "Register the document is written in. 'auto' (default) reads it off the text: a 公文 opens 敬啟者 and signs off 謹啟. 'formal' licenses the forms that register mandates, so 予以核准 and 因為…所以 stop being reported. Suppression only; never changes what is suggested for anything it does report."
-            }));
-        props.insert("rhythm".into(), json!({
-                "type": "boolean",
-                "description": "Advisory rhythm (氣口) checks: over-long sentences, consecutive sentences closing on the same particle, and a relaxed 定語堆疊 gate. Default: false. Advisory only, never applied by any fix tier."
-            }));
-        props.insert("ai_threshold".into(), json!({
-                "type": "string",
-                "enum": ["low", "medium", "high"],
-                "description": "AI detection sensitivity: 'low' (sensitive, catches more), 'medium' (balanced), 'high' (conservative). Only effective with detect_ai=true"
-            }));
-        props.insert("include_telemetry".into(), json!({
-                "type": "boolean",
-                "description": "Include per-request token telemetry metrics in the response (LLM cost accounting)"
-            }));
-        props.insert("include_stats".into(), json!({
-                "type": "boolean",
-                "description": "Include per-issue resolution tier and session-level summary_metrics (deterministic/heuristic/llm_judged/unresolved counts, confidence distribution)"
-            }));
-        props
-    })
-}
-
-fn tool_definitions() -> Vec<Tool> {
-    // Cloning the Arc, not the schema: the value is identical on every listing,
-    // and deep-copying a dozen nested property objects to produce it again is
-    // work with no result.
-    let input_schema = input_schema().clone();
-
-    vec![Tool::new(
-        "zhtw",
-        "Lint/fix/gate zh-TW text. Auto-converts Simplified Chinese to Traditional before applying rules. Use verify=true to calibrate issues via Google Translate anchor matching.",
-        input_schema,
-    )
-    .with_annotations(ToolAnnotations::new().read_only(true).idempotent(true))]
-}
-
-/// The tools this server exposes.
-///
-/// The lists below all say the same thing about caching, and say it because
-/// they have to: `ttlMs` and `cacheScope` are required of a cacheable result
-/// from 2026-07-28 on and the SDK leaves both unset. Zero and private is the
-/// honest answer here, since the ruleset is fixed for the process but a
-/// restart with different overrides or packs changes these lists and nothing
-/// would tell the client.
-pub(crate) fn list_tools() -> ListToolsResult {
-    ListToolsResult::with_all_items(tool_definitions())
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-}
-
-pub(crate) fn list_resources() -> ListResourcesResult {
-    resources::list_resources()
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-}
-
-/// No resource templates: this server exposes two fixed URIs and no patterns.
-pub(crate) fn list_resource_templates() -> ListResourceTemplatesResult {
-    ListResourceTemplatesResult::with_all_items(Vec::new())
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-}
-
-pub(crate) fn list_prompts() -> ListPromptsResult {
-    ListPromptsResult::with_all_items(prompts::list_prompts())
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-}
-
-pub(crate) fn get_prompt(
-    name: &str,
-    arguments: &std::collections::HashMap<String, String>,
-) -> ParamResult<GetPromptResult> {
-    prompts::get_prompt(name, arguments)
-        .ok_or_else(|| ErrorData::invalid_params(format!("unknown prompt: {name}"), None))
-}
 
 impl Catalog {
     /// Read one resource. Needs the ruleset, so it takes the catalogue rather
@@ -3064,23 +1218,6 @@ fn restore_preserved_states(
             issue.refresh_suggested_rewrite();
         }
     }
-}
-
-/// A tool-level error: the call succeeded at the protocol layer and failed at
-/// the tool layer, which is what lets a client show it rather than fail.
-fn tool_error(message: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(message)])
-}
-
-/// One text block, which is the only shape this tool returns.
-///
-/// `isError` is cleared rather than sent as `false`: it was absent on success
-/// before the SDK landed, and a client testing for the key's presence rather
-/// than its value would read the explicit `false` as a failure.
-fn tool_text(text: String) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-    result.is_error = None;
-    result
 }
 
 #[cfg(test)]

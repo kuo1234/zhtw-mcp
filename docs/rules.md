@@ -73,6 +73,10 @@ Also detects: enumeration comma misuse (`，` where `、` is appropriate for coo
 
 English-only contexts, thousand separators (1,000), and decimal numbers (3.14) are left untouched.
 
+### CJK boundary spacing policy
+
+By default, CJK/Latin and CJK/digit boundaries require a stored U+0020 space. This follows the Chinese Copywriting Guidelines and remains the default because the linter also checks plain text, commit messages, catalogs, and terminals, where CSS cannot supply the visual gap. Set `--spacing strip`, `spacing = "strip"` in `.zhtw-mcp.toml`, or `spacing: "strip"` in MCP and browser-WASM options when a project controls its HTML rendering and wants to remove those stored spaces. The strip policy is compatible with CSS [`text-autospace`](https://developer.mozilla.org/en-US/docs/Web/CSS/text-autospace), which became Baseline newly available in November 2025. [UTR #59](https://www.unicode.org/reports/tr59/) describes layout-time autospacing but is a draft, so it is not a source-text requirement. This policy affects only CJK/Latin and CJK/digit boundaries: spaces next to full-width punctuation, repeated full-width punctuation, and full-width digits keep their existing behavior. It also governs one character, U+0020, the space `require` inserts. A tab or a newline at a boundary is layout, and U+00A0 or U+3000 is typography the author chose, so `strip` leaves all four alone.
+
 ## political_coloring
 
 Terms carrying political framing inappropriate for Taiwan contexts.

@@ -2382,6 +2382,7 @@
         assert!(default_cfg.punctuation);
         assert!(default_cfg.quotes);
         assert!(default_cfg.spacing);
+        assert_eq!(default_cfg.spacing_policy, SpacingPolicy::Require);
         assert!(default_cfg.colon_enforcement);
         assert!(!default_cfg.variant_normalization);
         assert!(!default_cfg.range_en_dash);

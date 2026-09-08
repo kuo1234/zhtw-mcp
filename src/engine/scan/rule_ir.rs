@@ -1167,6 +1167,71 @@ fn build_automata(spelling_rules: &[SpellingRule]) -> Automata {
     (absorber_strings, ac_charwise, ac_bytewise)
 }
 
+/// A group is kept only when it can do what the field promises. Malformed
+/// shapes are dropped whole, never repaired, because a repaired group
+/// changes auto-fix eligibility without saying so: filtering the empty entry
+/// out of "["改善", ""]" would leave one candidate, and one candidate is
+/// writable.
+///
+/// "usable" covers both lists: empty can never select or would erase the
+/// rule default, and an empty string is worse than useless in either
+/// position. As a clue it always matches, since "window.contains(\"\")" is
+/// true for every window, so one stray entry makes the group the answer for
+/// every match of the rule. As a replacement it is the deletion sentinel,
+/// which would turn a substitution into a deletion.
+///
+/// Groups are refused outright on a rule whose own "to" is that sentinel:
+/// inflation derives the reported span from the rule default, so a group
+/// offering a real replacement would report a span shorter than the one it
+/// rewrites.
+///
+/// A rule left with no usable group compiles to None so inflation skips the
+/// window scan.
+fn compile_context_selector(r: &SpellingRule) -> Option<CompiledContextSelector> {
+    fn usable(v: &[String]) -> bool {
+        !v.is_empty() && v.iter().all(|s| !s.is_empty())
+    }
+
+    if r.has_deletion_sentinel() {
+        return None;
+    }
+    let groups: Vec<&crate::rules::ruleset::ContextSuggestion> = r
+        .context_suggestions
+        .iter()
+        .flatten()
+        .filter(|g| usable(&g.clues) && usable(&g.to))
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut group_of: Vec<usize> = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        for clue in g.clues.iter() {
+            patterns.push(clue.as_str());
+            group_of.push(gi);
+        }
+    }
+
+    // Standard (not leftmost) match kind: selection needs every clue that is
+    // present, not the one the automaton would prefer.
+    //
+    // Noncontiguous NFA because build cost is what matters here. This runs once
+    // per scanner construction, inside a 50 ms cold-start budget, over a
+    // handful of short words; the faster automata earn their construction back
+    // on document-length haystacks, not on a 240-byte window.
+    let clue_ac = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
+        .kind(Some(aho_corasick::AhoCorasickKind::NoncontiguousNFA))
+        .build(&patterns)
+        .ok()?;
+    Some(CompiledContextSelector {
+        clue_ac,
+        group_of,
+        to: groups.iter().map(|g| Arc::from(g.to.as_slice())).collect(),
+    })
+}
+
 /// Compile a set of spelling rules into a `CompiledSpellingDb`.
 ///
 /// Filters disabled rules, deduplicates by `from` key (last wins),
@@ -1203,73 +1268,9 @@ pub fn compile_spelling_rules_filtered(
         .map(|r| r.context_clues.as_ref().map(|v| Arc::from(v.as_slice())))
         .collect();
 
-    // A group is kept only when it can do what the field promises. Malformed
-    // shapes are dropped whole, never repaired, because a repaired group
-    // changes auto-fix eligibility without saying so: filtering the empty entry
-    // out of "["改善", ""]" would leave one candidate, and one candidate is
-    // writable.
-    //
-    // "usable" covers both lists: empty can never select or would erase the
-    // rule default, and an empty string is worse than useless in either
-    // position. As a clue it always matches, since "window.contains(\"\")" is
-    // true for every window, so one stray entry makes the group the answer for
-    // every match of the rule. As a replacement it is the deletion sentinel,
-    // which would turn a substitution into a deletion.
-    //
-    // Groups are refused outright on a rule whose own "to" is that sentinel:
-    // inflation derives the reported span from the rule default, so a group
-    // offering a real replacement would report a span shorter than the one it
-    // rewrites.
-    //
-    // A rule left with no usable group compiles to None so inflation skips the
-    // window scan.
-    fn usable(v: &[String]) -> bool {
-        !v.is_empty() && v.iter().all(|s| !s.is_empty())
-    }
-
     let spelling_context_suggestions: Vec<Option<CompiledContextSelector>> = spelling_rules
         .iter()
-        .map(|r| {
-            if r.has_deletion_sentinel() {
-                return None;
-            }
-            let groups: Vec<&crate::rules::ruleset::ContextSuggestion> = r
-                .context_suggestions
-                .iter()
-                .flatten()
-                .filter(|g| usable(&g.clues) && usable(&g.to))
-                .collect();
-            if groups.is_empty() {
-                return None;
-            }
-            let mut patterns: Vec<&str> = Vec::new();
-            let mut group_of: Vec<usize> = Vec::new();
-            for (gi, g) in groups.iter().enumerate() {
-                for clue in g.clues.iter() {
-                    patterns.push(clue.as_str());
-                    group_of.push(gi);
-                }
-            }
-
-            // Standard (not leftmost) match kind: selection needs every clue
-            // that is present, not the one the automaton would prefer.
-            //
-            // Noncontiguous NFA because build cost is what matters here. This
-            // runs once per scanner construction, inside a 50 ms cold-start
-            // budget, over a handful of short words; the faster automata earn
-            // their construction back on document-length haystacks, not on a
-            // 240-byte window.
-            let clue_ac = AhoCorasickBuilder::new()
-                .match_kind(MatchKind::Standard)
-                .kind(Some(aho_corasick::AhoCorasickKind::NoncontiguousNFA))
-                .build(&patterns)
-                .ok()?;
-            Some(CompiledContextSelector {
-                clue_ac,
-                group_of,
-                to: groups.iter().map(|g| Arc::from(g.to.as_slice())).collect(),
-            })
-        })
+        .map(compile_context_selector)
         .collect();
 
     let spelling_editorial_confidence: Vec<Option<crate::rules::ruleset::EditorialConfidence>> =

@@ -5,13 +5,18 @@
 // 3. No space adjacent to full-width punctuation
 // 4. No repeated full-width punctuation marks
 // 5. Full-width digits → half-width
+//
+// Rules 1 and 2 are the two halves of one boundary policy, so SpacingPolicy
+// decides which way they read: Require reports the missing space, Strip reports
+// the stored space as removable. Rules 3, 4 and 5 are not boundary policy and
+// run identically under both.
 
 use super::emit::Emitter;
 use std::iter::Peekable;
 use std::str::CharIndices;
 
 use crate::engine::excluded::{is_excluded, ByteRange};
-use crate::rules::ruleset::{Issue, IssueType, Severity};
+use crate::rules::ruleset::{Issue, IssueType, ProfileConfig, Severity, SpacingPolicy};
 
 use super::{is_cjk_ideograph, punct_issue_sev};
 
@@ -74,7 +79,11 @@ impl super::Scanner {
     /// - Unwanted space adjacent to full-width punctuation (rule 3)
     /// - Repeated full-width punctuation marks (rule 4)
     /// - Full-width digits that should be half-width (rule 5)
-    pub(crate) fn scan_spacing(&self, em: &mut Emitter<'_>) {
+    ///
+    /// Takes the whole config rather than the one axis it reads today, the
+    /// same shape as scan_punctuation: a second spacing axis then costs a
+    /// field rather than a parameter at every call site.
+    pub(crate) fn scan_spacing(&self, em: &mut Emitter<'_>, cfg: &ProfileConfig) {
         let text = em.text;
         let excluded = em.excluded;
         let issues = &mut *em.issues;
@@ -106,15 +115,15 @@ impl super::Scanner {
             }
 
             if !excluded_ch {
-                check_char(
-                    &mut iter,
+                let ctx = CharCtx {
                     offset,
                     ch,
                     prev,
                     same_punct_run,
                     excluded,
-                    issues,
-                );
+                    policy: cfg.spacing_policy,
+                };
+                check_char(&mut iter, &ctx, issues);
             }
 
             // Single update point for prev, which is why the per-character
@@ -124,23 +133,29 @@ impl super::Scanner {
     }
 }
 
-/// Apply rules 1 to 5 at one character. Rules 4 and 5 are mutually exclusive
-/// with the adjacency rules, so each match returns.
-fn check_char(
-    iter: &mut Peekable<CharIndices<'_>>,
+/// One character and everything the rules at that position read. The rules
+/// took a parameter each before the boundary policy joined them, which put
+/// the function over the argument limit; a context also mirrors how the
+/// lexical and structural passes carry their state.
+struct CharCtx<'a> {
     offset: usize,
     ch: char,
     prev: Option<(usize, char)>,
     same_punct_run: usize,
-    excluded: &[ByteRange],
-    issues: &mut Vec<Issue>,
-) {
+    excluded: &'a [ByteRange],
+    policy: SpacingPolicy,
+}
+
+/// Apply rules 1 to 5 at one character. Rules 4 and 5 are mutually exclusive
+/// with the adjacency rules, so each match returns; the boundary policy is
+/// not, so it never returns from here and rule 3 always gets its turn.
+fn check_char(iter: &mut Peekable<CharIndices<'_>>, ctx: &CharCtx<'_>, issues: &mut Vec<Issue>) {
     // Rule 5: full-width digits should be half-width.
-    if is_fullwidth_digit(ch) {
-        let hw = fullwidth_to_halfwidth_digit(ch);
+    if is_fullwidth_digit(ctx.ch) {
+        let hw = fullwidth_to_halfwidth_digit(ctx.ch);
         issues.push(punct_issue_sev(
-            offset,
-            &ch.to_string(),
+            ctx.offset,
+            &ctx.ch.to_string(),
             &hw.to_string(),
             "數字應使用半形字元",
             Severity::Warning,
@@ -150,12 +165,12 @@ fn check_char(
 
     // Rule 4: repeated full-width punctuation. Paired punct (…… and ——) is
     // allowed at exactly two, so it only trips from the third onward.
-    if is_fullwidth_punct(ch) && same_punct_run > 0 {
-        let limit = if is_paired_punct(ch) { 2 } else { 1 };
-        if same_punct_run >= limit {
+    if is_fullwidth_punct(ctx.ch) && ctx.same_punct_run > 0 {
+        let limit = if is_paired_punct(ctx.ch) { 2 } else { 1 };
+        if ctx.same_punct_run >= limit {
             issues.push(punct_issue_sev(
-                offset,
-                &ch.to_string(),
+                ctx.offset,
+                &ctx.ch.to_string(),
                 "",
                 "不重複使用標點符號",
                 Severity::Warning,
@@ -168,50 +183,134 @@ fn check_char(
     let Some(&(next_offset, next_ch)) = iter.peek() else {
         return;
     };
-    if is_excluded(next_offset, next_offset + next_ch.len_utf8(), excluded) {
+    if is_excluded(next_offset, next_offset + next_ch.len_utf8(), ctx.excluded) {
         return;
     }
 
+    match ctx.policy {
+        SpacingPolicy::Require => check_missing_boundary_space(ctx, next_ch, issues),
+        SpacingPolicy::Strip => {
+            check_stored_boundary_space(iter, ctx, next_offset, next_ch, issues)
+        }
+    }
+
+    // Rule 3: no space on either side of full-width punctuation. Reached under
+    // both policies, whatever the boundary check above made of this character.
+    check_space_before_punct(iter, ctx, issues);
+    check_space_after_punct(iter, ctx.ch, next_offset, next_ch, issues);
+}
+
+/// Rules 1 and 2 under `Require`: the boundary is missing its space.
+fn check_missing_boundary_space(ctx: &CharCtx<'_>, next_ch: char, issues: &mut Vec<Issue>) {
     // Rule 1: CJK immediately adjacent to Latin.
-    if (is_cjk_ideograph(ch) && next_ch.is_ascii_alphabetic())
-        || (ch.is_ascii_alphabetic() && is_cjk_ideograph(next_ch))
-    {
+    if is_cjk_latin_boundary(ctx.ch, next_ch) {
         issues.push(missing_space_issue(
-            offset + ch.len_utf8(),
+            ctx.offset + ctx.ch.len_utf8(),
             "中英文之間需要增加空格",
         ));
     }
 
     // Rule 2: CJK immediately adjacent to a digit.
-    if (is_cjk_ideograph(ch) && next_ch.is_ascii_digit())
-        || (ch.is_ascii_digit() && is_cjk_ideograph(next_ch))
-    {
+    if is_cjk_digit_boundary(ctx.ch, next_ch) {
         issues.push(missing_space_issue(
-            offset + ch.len_utf8(),
+            ctx.offset + ctx.ch.len_utf8(),
             "中文與數字之間需要增加空格",
         ));
     }
+}
 
-    // Rule 3: no space on either side of full-width punctuation.
-    check_space_before_punct(iter, offset, ch, prev, issues);
-    check_space_after_punct(iter, next_offset, ch, next_ch, issues);
+/// Rules 1 and 2 under `Strip`: the boundary stores a space that the policy
+/// hands to the renderer instead. Rules 1 and 2 only see characters that are
+/// already adjacent, so the boundary has to be found by looking past the
+/// space run.
+///
+/// Gated on the left character first: the boundary predicates below both need
+/// it to be CJK or ASCII alphanumeric, which is knowable without walking, and
+/// under this policy every space in the document reaches here.
+fn check_stored_boundary_space(
+    iter: &Peekable<CharIndices<'_>>,
+    ctx: &CharCtx<'_>,
+    next_offset: usize,
+    next_ch: char,
+    issues: &mut Vec<Issue>,
+) {
+    if !is_boundary_space(next_ch) || !can_open_boundary(ctx.ch) {
+        return;
+    }
+    let Some((following_offset, following_ch)) = space_run_target(iter) else {
+        return;
+    };
+    if is_excluded(
+        following_offset,
+        following_offset + following_ch.len_utf8(),
+        ctx.excluded,
+    ) {
+        return;
+    }
+    let context = if is_cjk_latin_boundary(ctx.ch, following_ch) {
+        "中英文之間不加空格"
+    } else if is_cjk_digit_boundary(ctx.ch, following_ch) {
+        "中文與數字之間不加空格"
+    } else {
+        return;
+    };
+    issues.push(unwanted_space_issue(
+        next_offset,
+        following_offset - next_offset,
+        context,
+    ));
+}
+
+/// True for the one character this file treats as a stored space.
+///
+/// U+0020 and nothing else: it is what `Require` inserts, what rule 3 removes
+/// and what `Strip` takes back out, so the three agree on what a space is.
+/// U+00A0 and U+3000 are typography an author chose rather than a boundary
+/// gap, and a tab or a newline is layout. Deliberately narrower than
+/// `adjacent_cjk`, which skips every Unicode whitespace.
+fn is_boundary_space(ch: char) -> bool {
+    ch == ' '
+}
+
+/// True if `ch` can be the left side of a CJK/Latin or CJK/digit boundary.
+fn can_open_boundary(ch: char) -> bool {
+    is_cjk_ideograph(ch) || ch.is_ascii_alphanumeric()
+}
+
+/// What the space run starting at `iter`'s peeked position leads to.
+///
+/// The caller has already peeked the first space, so this skips it and reports
+/// the first non-space character with its offset. Rules 1, 2 and 3 all measure
+/// their span as that offset minus the run's start.
+fn space_run_target(iter: &Peekable<CharIndices<'_>>) -> Option<(usize, char)> {
+    let mut fwd = iter.clone();
+    fwd.next();
+    next_non_space(fwd)
+}
+
+fn is_cjk_latin_boundary(left: char, right: char) -> bool {
+    (is_cjk_ideograph(left) && right.is_ascii_alphabetic())
+        || (left.is_ascii_alphabetic() && is_cjk_ideograph(right))
+}
+
+fn is_cjk_digit_boundary(left: char, right: char) -> bool {
+    (is_cjk_ideograph(left) && right.is_ascii_digit())
+        || (left.is_ascii_digit() && is_cjk_ideograph(right))
 }
 
 /// Rule 3, leading half: a space run between content and full-width punct.
 fn check_space_before_punct(
     iter: &Peekable<CharIndices<'_>>,
-    offset: usize,
-    ch: char,
-    prev: Option<(usize, char)>,
+    ctx: &CharCtx<'_>,
     issues: &mut Vec<Issue>,
 ) {
-    if ch != ' ' {
+    if !is_boundary_space(ctx.ch) {
         return;
     }
-    let Some((_, content_ch)) = prev.filter(|&(_, pc)| pc != ' ') else {
+    let Some((_, content_ch)) = ctx.prev.filter(|&(_, pc)| !is_boundary_space(pc)) else {
         return;
     };
-    if !is_cjk_ideograph(content_ch) && !content_ch.is_ascii_alphanumeric() {
+    if !can_open_boundary(content_ch) {
         return;
     }
     let Some((punct_offset, punct_ch)) = next_non_space(iter.clone()) else {
@@ -221,8 +320,8 @@ fn check_space_before_punct(
         return;
     }
     issues.push(unwanted_space_issue(
-        offset,
-        punct_offset - offset,
+        ctx.offset,
+        punct_offset - ctx.offset,
         "全形標點與其他字元之間不加空格",
     ));
 }
@@ -230,21 +329,18 @@ fn check_space_before_punct(
 /// Rule 3, trailing half: a space run between full-width punct and content.
 fn check_space_after_punct(
     iter: &Peekable<CharIndices<'_>>,
-    next_offset: usize,
     ch: char,
+    next_offset: usize,
     next_ch: char,
     issues: &mut Vec<Issue>,
 ) {
-    if !is_fullwidth_punct(ch) || next_ch != ' ' {
+    if !is_fullwidth_punct(ch) || !is_boundary_space(next_ch) {
         return;
     }
-    // Skip the space already peeked, then find what the run leads to.
-    let mut fwd = iter.clone();
-    fwd.next();
-    let Some((content_offset, content_ch)) = next_non_space(fwd) else {
+    let Some((content_offset, content_ch)) = space_run_target(iter) else {
         return;
     };
-    if !is_cjk_ideograph(content_ch) && !content_ch.is_ascii_alphanumeric() {
+    if !can_open_boundary(content_ch) {
         return;
     }
     issues.push(unwanted_space_issue(
@@ -254,7 +350,7 @@ fn check_space_after_punct(
     ));
 }
 
-/// First non-space character at or after `fwd`'s current position.
+/// First non-space character at or after the position of `fwd`.
 fn next_non_space(fwd: Peekable<CharIndices<'_>>) -> Option<(usize, char)> {
     fwd.into_iter().find(|&(_, ch)| ch != ' ')
 }
