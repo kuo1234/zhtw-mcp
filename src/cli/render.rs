@@ -472,6 +472,21 @@ pub(crate) const AGENT_PASS: &str = "PASS";
 /// rather than a determined correction.
 const AGENT_AMBIG: &str = "AMBIG";
 
+/// Flatten a span onto the single line the format promises.
+///
+/// A found span is usually a term and fits by itself, but a translationese or
+/// grammar finding can cover a heading and the sentence under it, newline and
+/// all. This format documents one line per finding and tells a parser how to
+/// split it, so a span that breaks the line breaks that contract: the second
+/// half arrives looking like a finding with no location.
+///
+/// The span is not truncated along with it. It is long because the finding is
+/// long, and a reader that cannot search for the text it was handed is worse
+/// off than one that pays for a few more tokens.
+fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+}
+
 /// The right-hand side of one agent line: every candidate, not the first one
 /// with a count.
 ///
@@ -570,7 +585,7 @@ pub(crate) fn render_agent(r: &FileReport<'_>, explain: bool) -> usize {
         } else {
             (*severity, "->")
         };
-        print!("{locs} {tag} {found} {arrow} {}", group.target);
+        print!("{locs} {tag} {} {arrow} {}", one_line(found), group.target);
 
         // Only an AMBIG line takes the annotation, and only when asked. The
         // agent already holds the document, so the sentence around the finding

@@ -1326,6 +1326,43 @@ fn cli_lint_agent_format_report_owns_stdout() {
     );
 }
 
+#[test]
+fn cli_lint_agent_format_keeps_a_multi_line_span_on_one_line() {
+    // A translationese or grammar span can cover a heading and the sentence
+    // under it. The format promises one line per finding and tells a parser how
+    // to split it, so a raw newline in the span hands that parser a second half
+    // that looks like a finding with no location.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("doc.md"),
+        "## 繁中交付物一律先校正\n只要產出的是要給人看的繁體中文，交出去之前一定要跑一次檢查。\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zhtw-mcp"))
+        .args([
+            "lint",
+            "doc.md",
+            "--format",
+            "agent",
+            "--content-type",
+            "markdown",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().count() > 0,
+        "expected a finding to render: {stdout}"
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.starts_with("doc.md:") || line == "PASS",
+            "every line is a whole finding, not the tail of one: {line}"
+        );
+    }
+}
+
 // -- Compact format tests --------------------------------------------------
 
 #[test]
