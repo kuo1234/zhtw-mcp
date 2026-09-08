@@ -547,3 +547,23 @@ fn rule2_boundary_digit_then_cjk() {
         "should flag missing space digit→CJK: {issues:?}"
     );
 }
+
+#[test]
+fn strip_never_reports_a_span_that_covers_excluded_bytes() {
+    // An exclusion can begin or end inside the run, not only on the character
+    // the lookahead lands on. Reporting the whole run then hands the fixer a
+    // span that deletes protected bytes.
+    let text = "中   A";
+    let excluded = [ByteRange { start: 4, end: 5 }];
+    let issues = spacing_issues_excluding(text, SpacingPolicy::Strip, &excluded);
+    assert!(
+        boundary_strip_issues(&issues).is_empty(),
+        "a run holding excluded bytes is not removable: {issues:?}"
+    );
+
+    // Without the exclusion the same run is still reported whole.
+    let clean = spacing_issues_excluding(text, SpacingPolicy::Strip, &[]);
+    let strip = boundary_strip_issues(&clean);
+    assert_eq!(strip.len(), 1);
+    assert_eq!((strip[0].offset, strip[0].length), (3, 3));
+}

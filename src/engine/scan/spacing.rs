@@ -240,8 +240,12 @@ fn check_stored_boundary_space(
     let Some((following_offset, following_ch)) = space_run_target(iter) else {
         return;
     };
+
+    // The whole span, not just the character it lands on: an exclusion that
+    // starts or ends inside the run would otherwise be covered by a removal
+    // that reports past it, and the fixer would delete protected bytes.
     if is_excluded(
-        following_offset,
+        next_offset,
         following_offset + following_ch.len_utf8(),
         ctx.excluded,
     ) {

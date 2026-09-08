@@ -70,7 +70,7 @@ claim needs a citation.
 
 Profiles control how strict the zh-TW norm enforcement is. Flags are orthogonal -- `detect_ai` works with either profile, `relaxed` can combine with `strict` if you want variant normalization but lenient punctuation.
 
-`spacing=require` is the default because source text also appears outside CSS-capable renderers. Projects that control their HTML can select `strip` and use [`text-autospace`](https://developer.mozilla.org/en-US/docs/Web/CSS/text-autospace), a Baseline newly-available property since November 2025. [UTR #59](https://www.unicode.org/reports/tr59/) is a draft for layout-time autospacing, not a requirement to remove source-text spaces. Either way the policy governs the U+0020 space and only at CJK/Latin and CJK/digit boundaries.
+`spacing=require` is the default because source text also appears outside CSS-capable renderers. Projects that control their HTML can select `strip` and use [`text-autospace`](https://developer.mozilla.org/en-US/docs/Web/CSS/text-autospace), a Baseline newly-available property since November 2025. [UTR #59](https://www.unicode.org/reports/tr59/) is a draft for layout-time autospacing, not a requirement to remove source-text spaces. Either way the policy governs the U+0020 space, and only where CJK meets an ASCII letter or an ASCII digit.
 
 See [docs/rules.md](docs/rules.md) for the full rule reference.
 

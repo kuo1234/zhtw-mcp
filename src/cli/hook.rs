@@ -263,12 +263,17 @@ fn scan_file(
         Some(store) => {
             let packs =
                 zhtw_mcp::rules::store::PackStore::new(zhtw_mcp::rules::store::default_packs_dir());
+
+            // The project's packs, the same list lint unions in from the
+            // config. Without them the hook stays quiet about pack-only
+            // findings that lint reports on the very same file.
+            let active: Vec<String> = project.and_then(|c| c.packs.clone()).unwrap_or_default();
             let (spelling, case) = zhtw_mcp::rules::store::build_merged_rules(
                 &ruleset.spelling_rules,
                 &ruleset.case_rules,
                 store,
                 &packs,
-                &[],
+                &active,
             );
             Scanner::new_filtered(spelling, case, &filter)
         }
@@ -308,6 +313,11 @@ fn scan_file(
 /// or picks a spacing policy must not be nagged about what that choice
 /// silences, or the hook contradicts the linter it speaks for.
 fn project_config(project: Option<&zhtw_mcp::config::ProjectConfig>) -> ProfileConfig {
+    // A profile name this build does not know degrades to base rather than
+    // failing the way lint does. The two differ on purpose: lint is a command
+    // whose exit code the author is reading, and a hook that refuses to run
+    // breaks the write loop it sits in. Base is the safe direction, since it
+    // enforces a subset of strict and can only under-report.
     let profile = project
         .and_then(|c| c.profile.as_deref())
         .and_then(Profile::from_str_strict)

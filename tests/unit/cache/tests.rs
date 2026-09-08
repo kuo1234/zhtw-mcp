@@ -26,7 +26,10 @@ fn subject_with<'a>(file_path: &'a str, content: &'a [u8], mtime_secs: u64) -> C
         content,
         mtime_secs,
         size: content.len() as u64,
-        text_char_count: content.len(),
+
+        // Characters, not bytes: the cache stores a character count, and the
+        // two part company the moment the content is not ASCII.
+        text_char_count: String::from_utf8_lossy(content).chars().count(),
         ..subject(file_path)
     }
 }
