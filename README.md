@@ -1,5 +1,7 @@
 # zhtw-mcp
 
+**English** | [繁體中文](README.zh-TW.md)
+
 A linguistic linter for Traditional Chinese (zh-TW) that enforces Taiwan Ministry of Education (MoE) standards on vocabulary, punctuation, and character shapes. It plugs into AI coding assistants through the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) and catches Mainland Chinese (zh-CN) regional drift before it reaches the user.
 
 The tool enforces three official Taiwan standards:
