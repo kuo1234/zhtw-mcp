@@ -432,8 +432,9 @@ fn parse_lint(rest: &[String]) -> Result<(LintArgs, usize)> {
                     "sarif" => LintFormat::Sarif,
                     "compact" => LintFormat::Compact,
                     "tabular" => LintFormat::Tabular,
+                    "agent" => LintFormat::Agent,
                     _ => anyhow::bail!(
-                        "unknown format: {fmt} (expected 'json', 'human', 'sarif', 'compact', or 'tabular')"
+                        "unknown format: {fmt} (expected 'json', 'human', 'sarif', 'compact', 'tabular', or 'agent')"
                     ),
                 };
             }

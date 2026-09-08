@@ -1157,6 +1157,175 @@ fn cli_lint_human_format_multi_file() {
     );
 }
 
+// -- Agent format tests -----------------------------------------------------
+
+#[test]
+fn cli_lint_agent_format_single_issue() {
+    let output = run_lint_stdin(&["--format", "agent"], "這個軟件很好用");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout, "1:3 W 軟件 -> 軟體\n",
+        "agent format is <locs> <tag> <found> -> <target> and nothing else"
+    );
+    assert!(
+        !stdout.contains("\x1b["),
+        "agent must not contain ANSI codes: {stdout}"
+    );
+}
+
+#[test]
+fn cli_lint_agent_format_clean_prints_pass() {
+    // The one thing this format says that compact does not. Empty stdout with
+    // exit 0 is also what a crashed pipeline looks like, and the reader here is
+    // a model deciding whether it is finished.
+    let output = run_lint_stdin(&["--format", "agent"], "這是正確的繁體中文。");
+    assert!(output.status.success(), "clean agent lint should exit 0");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "PASS\n");
+}
+
+#[test]
+fn cli_lint_agent_format_ambiguous_lists_every_candidate() {
+    // 視頻 carries three candidates, so no fix tier can settle it and the
+    // reader has to. compact renders that as 影片+2, which is legible and
+    // useless to an agent that has to pick one.
+    let output = run_lint_stdin(&["--format", "agent"], "串流視頻");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("AMBIG 視頻 ? 影片|影音|視訊"),
+        "several candidates should print as AMBIG with all of them: {stdout}"
+    );
+    assert!(
+        !stdout.contains("+2"),
+        "the compact +N summary has no place here: {stdout}"
+    );
+}
+
+#[test]
+fn cli_lint_agent_format_groups_every_location() {
+    let output = run_lint_stdin(&["--format", "agent"], "平台上的視頻、視頻、視頻");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "one finding, one line: {stdout}");
+    assert!(
+        lines[0].starts_with("1:5,1:8,1:11 "),
+        "every location is listed, not the first with a count: {stdout}"
+    );
+}
+
+#[test]
+fn cli_lint_agent_format_path_prefix_appears_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    std::fs::write(&path, "平台上的視頻、視頻").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zhtw-mcp"))
+        .args(["lint", "doc.md", "--format", "agent"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("doc.md:").count(),
+        1,
+        "the path prefixes the first location only: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("doc.md:1:5,1:8 "),
+        "later locations are bare line:col: {stdout}"
+    );
+}
+
+#[test]
+fn cli_lint_agent_format_explain_annotates_only_ambiguous() {
+    // A determined correction needs no note; the agent applies it. A judgment
+    // call is the only place the ruleset has something left to say.
+    let output = run_lint_stdin(&["--format", "agent", "--explain"], "這個軟件與串流視頻");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(" AMBIG "),
+        "expected a judgment call: {stdout}"
+    );
+    assert!(
+        stdout.contains(" -> "),
+        "expected a determined one too: {stdout}"
+    );
+    for line in stdout.lines() {
+        assert_eq!(
+            line.contains(" ["),
+            line.contains(" AMBIG "),
+            "--explain annotates AMBIG lines and only those: {line}"
+        );
+    }
+}
+
+#[test]
+fn cli_lint_agent_format_no_pass_when_another_file_reports() {
+    // PASS is the whole output of a clean run, so a clean file in a run that
+    // found something elsewhere contributes nothing rather than a verdict.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("clean.md"), "這是正確的繁體中文。").unwrap();
+    std::fs::write(dir.path().join("dirty.md"), "這個軟件很好用").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zhtw-mcp"))
+        .args(["lint", "clean.md", "dirty.md", "--format", "agent"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("PASS"),
+        "a run with a finding is not a PASS: {stdout}"
+    );
+    assert_eq!(stdout.lines().count(), 1, "one finding, one line: {stdout}");
+}
+
+#[test]
+fn cli_lint_agent_format_fix_reports_only_the_residue() {
+    // The fix and the rescan happen inside the one invocation, so what comes
+    // out is what a second lint would find. This is the whole of the finalize
+    // skill's command, and reaching PASS in one call is the normal outcome.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    std::fs::write(&path, "這個軟件很好用").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zhtw-mcp"))
+        .args(["lint", "doc.md", "--fix", "--format", "agent"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "PASS\n");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "這個軟體很好用",
+        "--fix wrote the deterministic correction"
+    );
+}
+
+#[test]
+fn cli_lint_agent_format_honours_the_gate() {
+    let output = run_lint_stdin(
+        &["--format", "agent", "--max-warnings", "0"],
+        "這個軟件很好用",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the gate contract is unchanged by the format"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("軟件"));
+}
+
+#[test]
+fn cli_lint_agent_format_report_owns_stdout() {
+    // Every machine format puts the report on stdout, so a stdin rewrite has
+    // nowhere to go and has to say so rather than emptying the document.
+    let output = run_lint_stdin(&["--format", "agent", "--fix"], "這個軟件很好用");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "PASS\n", "stdout carries the report: {stdout}");
+    assert!(
+        stderr.contains("not emitted"),
+        "the discarded rewrite is reported on stderr: {stderr}"
+    );
+}
+
 // -- Compact format tests --------------------------------------------------
 
 #[test]

@@ -48,7 +48,7 @@ Usage:
 
 Options:
   --format <fmt>            Output format: human (default), json, compact,
-                            tabular, sarif
+                            tabular, sarif, agent
   --fix[=<mode>]            Apply fixes in place: lexical_safe (default),
                             orthographic, lexical_contextual
   --dry-run                 Preview fixes without writing
@@ -253,6 +253,56 @@ linting, fixing and converting never touch the network.
 | `compact` | `--format compact` | One line per issue |
 | `tabular` | `--format tabular` | Aligned columns for quick scanning |
 | `sarif` | `--format sarif` | SARIF v2.1.0 for GitHub Code Scanning |
+| `agent` | `--format agent` | Smallest report a coding agent can act on |
+
+### The agent format
+
+```bash
+zhtw-mcp lint doc.md --fix --format agent
+```
+
+```text
+12:8 W 軟件 -> 軟體
+30:2,44:9 AMBIG 質量 ? 品質
+```
+
+One line per distinct finding, `<locs> <tag> <found> -> <target>`, and every
+location the finding has rather than the first with a count. The path prefix
+appears once, on the first location, and is absent entirely for stdin. A clean
+run prints `PASS` and nothing else.
+
+`PASS` is the one thing this format says that `compact` does not. Compact
+prints nothing for a clean document, and empty stdout with exit 0 is also what
+a crashed pipeline looks like. The reader here is a model deciding whether it
+is finished, and one token is cheaper than leaving it to guess.
+
+The tag is the severity letter (`E`, `W`, `I`) when the correction is
+determined, and `AMBIG` when it is not, in which case the separator is `?` and
+the target is every candidate joined by `|`. AMBIG means no fix tier can settle
+the finding from the finding alone: several candidates, a clue-gated term whose
+domain has to be read off the sentence, a term the ruleset annotates
+`editorial_confidence: low`, or one `--verify` rejected. Judge those against
+the document, which the caller already has, and edit them by hand. `--explain`
+appends the ruleset's usage note to AMBIG lines and only those, for the case
+where the document does not settle it either.
+
+Run it with `--fix`, not after one. The fix and the rescan happen inside the
+one invocation, so what comes out is what a second lint would have found: the
+deterministic corrections are already written to the file and the report is the
+residue. Reaching `PASS` in one call is the normal outcome on a document with
+no judgment calls in it.
+
+A found span can hold a space, as the acronym rule's `C P U` does. A parser
+therefore takes the first two space-separated fields and splits the remainder
+on its last ` -> ` or ` ? `, not its first.
+
+Like every other machine format, `agent` puts the report on stdout and the
+status lines on stderr, so `--fix` over stdin discards the rewritten document.
+Pass a file.
+
+The [zhtw-finalize skill](../.claude/skills/zhtw-finalize/SKILL.md) is this
+format with a policy attached: which documents are worth a check, and which of
+the ones an agent writes are not.
 
 ## Inline suppression
 

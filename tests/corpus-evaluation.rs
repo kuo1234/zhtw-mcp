@@ -373,6 +373,95 @@ fn load_corpus(path: &str) -> CorpusSpec {
     serde_json::from_str(path).unwrap()
 }
 
+/// `Issue::needs_judgment` is the issue-intrinsic half of the fixer's verdict,
+/// restated outside the fixer so `--format agent` can label a finding AMBIG
+/// without running one. Two copies of one rule drift, and the way this pair
+/// would drift is silent: a term the fixer quietly started rewriting would go
+/// on being reported as a judgment call for the reader to make, or the reverse.
+///
+/// The corpora are the breadth this needs. Every case runs through the real
+/// scanner and the real `lexical_safe` fixer, so the assertion covers whatever
+/// the ruleset currently ships rather than the handful of rules a fixture
+/// author thought of.
+///
+/// One direction only. A finding the predicate calls settled can still go
+/// unfixed for reasons that belong to the run and not to the finding: the wrong
+/// tier, an excluded region, an overlap with a fix already written. The
+/// direction asserted here is the one the format's meaning rests on, which is
+/// that an AMBIG line is never something the fixer would have handled.
+#[test]
+fn agent_format_ambiguity_matches_the_safe_fixer() {
+    let (scanner, segmenter) = load_scanner();
+
+    let corpora = [
+        load_corpus(include_str!("corpus/ai-generated.json")),
+        load_corpus(include_str!("corpus/native-zh-tw.json")),
+        load_corpus(include_str!("corpus/cn-to-tw-conversion.json")),
+        load_corpus(include_str!("corpus/ambiguous.json")),
+        load_corpus(include_str!("corpus/deterministic.json")),
+        load_corpus(include_str!("corpus/editorial.json")),
+        load_corpus(include_str!("corpus/mixed-content.json")),
+    ];
+
+    let mut judged = 0usize;
+    let mut settled = 0usize;
+
+    for spec in &corpora {
+        for case in &spec.cases {
+            let scan_text = if spec.mode == "s2t" {
+                match case.scan_text.as_deref() {
+                    Some(text) => text,
+                    None => continue,
+                }
+            } else {
+                case.input.as_str()
+            };
+
+            let content_type = case_content_type(case);
+            let cfg = build_config(spec, case.detect_ai.unwrap_or(spec.detect_ai));
+            let issues = scanner
+                .scan_for_content_type_with_config(scan_text, content_type, cfg)
+                .issues;
+            let fixed = apply_fixes_with_context(
+                scan_text,
+                &issues,
+                FixMode::LexicalSafe,
+                &build_exclusions_for_content_type(scan_text, content_type),
+                Some(&segmenter),
+            );
+
+            for issue in &issues {
+                if issue.needs_judgment() {
+                    judged += 1;
+                    assert!(
+                        !fixed
+                            .applied_fixes
+                            .iter()
+                            .any(|f| f.offset == issue.offset && f.old_len == issue.length),
+                        "{}:{}: lexical_safe rewrote '{}' at {}, which agent format \
+                         reports as AMBIG for the reader to settle",
+                        spec.id,
+                        case.id,
+                        issue.found,
+                        issue.offset
+                    );
+                } else {
+                    settled += 1;
+                }
+            }
+        }
+    }
+
+    // A predicate that answered false to everything would pass the loop above
+    // without ever being exercised, and so would a corpus that stopped
+    // producing judgment calls.
+    assert!(
+        judged > 0 && settled > 0,
+        "the corpora produced {judged} judgment calls and {settled} settled \
+         findings, so this test proved nothing"
+    );
+}
+
 #[test]
 fn corpus_evaluation_suite() {
     let (scanner, segmenter) = load_scanner();

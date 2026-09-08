@@ -1,5 +1,5 @@
 // Output rendering for the lint subcommand: the typed shapes that go to stdout
-// and the five formatters that fill them.
+// and the six formatters that fill them.
 //
 // Typed structs rather than a Value tree, so serialization does not allocate an
 // intermediate document per file.
@@ -67,6 +67,7 @@ pub(crate) enum LintFormat {
     Sarif,
     Compact,
     Tabular,
+    Agent,
 }
 
 impl LintFormat {
@@ -79,9 +80,11 @@ impl LintFormat {
     pub(crate) fn report_owns_stdout(self) -> bool {
         match self {
             LintFormat::Human => false,
-            LintFormat::Json | LintFormat::Sarif | LintFormat::Compact | LintFormat::Tabular => {
-                true
-            }
+            LintFormat::Json
+            | LintFormat::Sarif
+            | LintFormat::Compact
+            | LintFormat::Tabular
+            | LintFormat::Agent => true,
         }
     }
 }
@@ -459,6 +462,129 @@ pub(crate) fn render_compact(r: &FileReport<'_>, explain: bool) {
         }
         println!();
     }
+}
+
+/// The whole of a clean agent-format run.  The batch prints it, and tests and
+/// the finalize skill both read for it, so the literal lives in one place.
+pub(crate) const AGENT_PASS: &str = "PASS";
+
+/// The tag an agent-format line carries when the finding is a judgment call
+/// rather than a determined correction.
+const AGENT_AMBIG: &str = "AMBIG";
+
+/// The right-hand side of one agent line: every candidate, not the first one
+/// with a count.
+///
+/// `compact_suggestion` renders several candidates as `影片+2`, which is a
+/// legible summary for a person reading a terminal and useless to an agent
+/// that has to pick one. The delete sentinel and the english fallback are the
+/// same in both, so only the arity case differs.
+fn agent_target(issue: &zhtw_mcp::rules::ruleset::Issue) -> String {
+    if issue.suggestions.is_empty() {
+        issue.english.as_deref().unwrap_or("?").to_string()
+    } else if zhtw_mcp::rules::ruleset::is_delete_suggestion(&issue.suggestions) {
+        zhtw_mcp::rules::ruleset::DELETE_SUGGESTION.to_string()
+    } else {
+        issue.suggestions.join("|")
+    }
+}
+
+/// Print one file's results in the agent format: one line per distinct
+/// finding, and nothing at all for a clean file.
+///
+/// The batch owns the `PASS` line rather than this function, because a clean
+/// file in a run that found something in another file has nothing to say.
+/// Returns how many lines went out, so the batch can tell those two cases
+/// apart without counting the issues a second time.
+///
+/// Locations are one comma-joined list rather than compact's first location
+/// plus an `(x3 also at ...)` tail. The two say the same thing and cost about
+/// the same; a plain list is one shape fewer for a parser on the other end.
+/// The path prefixes the first location only, where tabular repeats it on each:
+/// tabular does that to keep its columns independently parseable, and this
+/// format has no columns to keep independent.
+///
+/// The line is `<locs> <tag> <found> -> <target>`, with ` ? ` in place of
+/// ` -> ` when the tag is AMBIG. A found span can hold a space, as the acronym
+/// rule's `C P U` does, so a parser takes the first two space-separated fields
+/// and then splits the remainder on its last separator rather than its first.
+pub(crate) fn render_agent(r: &FileReport<'_>, explain: bool) -> usize {
+    use std::collections::HashMap;
+
+    // The compact dedup key plus the judgment flag. Verify calibration lands
+    // per occurrence, so two issues sharing every other field can still
+    // disagree about whether they are settled, and merging them would print one
+    // verdict for both.
+    type AgentKey<'a> = (&'a str, &'static str, String, &'static str, bool);
+    struct AgentGroup {
+        first_loc: (usize, usize),
+        locs: Vec<(usize, usize)>,
+        target: String,
+        context: Option<String>,
+    }
+
+    let mut groups: HashMap<AgentKey<'_>, AgentGroup> = HashMap::new();
+    let mut order: Vec<AgentKey<'_>> = Vec::new();
+    for issue in r.issues {
+        let (found, rule_type, suggestions, severity) = issue.compact_dedup_key();
+        let key = (
+            found,
+            rule_type,
+            suggestions,
+            severity,
+            issue.needs_judgment(),
+        );
+        let group = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            AgentGroup {
+                first_loc: (issue.line, issue.col),
+                locs: Vec::new(),
+                target: agent_target(issue),
+                context: issue.context.as_deref().map(str::to_string),
+            }
+        });
+        group.locs.push((issue.line, issue.col));
+    }
+
+    let file_prefix = display_path_prefix(r.file_arg);
+    order.sort_by_key(|k| groups[k].first_loc);
+
+    for key in &order {
+        let (found, _rt, _sug, severity, needs_judgment) = key;
+        let group = &groups[key];
+        let locs = group
+            .locs
+            .iter()
+            .enumerate()
+            .map(|(i, (l, c))| {
+                if i == 0 {
+                    format!("{file_prefix}{l}:{c}")
+                } else {
+                    format!("{l}:{c}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let (tag, arrow) = if *needs_judgment {
+            (AGENT_AMBIG, "?")
+        } else {
+            (*severity, "->")
+        };
+        print!("{locs} {tag} {found} {arrow} {}", group.target);
+
+        // Only an AMBIG line takes the annotation, and only when asked. The
+        // agent already holds the document, so the sentence around the finding
+        // is not news; what the ruleset knows about which sense the term
+        // carries is, and only where there is a choice to make.
+        if explain && *needs_judgment {
+            if let Some(ctx) = &group.context {
+                print!(" [{}]", ctx.replace(['\n', '\r'], " "));
+            }
+        }
+        println!();
+    }
+
+    order.len()
 }
 
 /// Print one file's results as header-once TSV. `header_printed` is shared

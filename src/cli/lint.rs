@@ -12,8 +12,8 @@ use std::process;
 
 use crate::cli::discover::{resolve_diff_files, resolve_file_args};
 use crate::cli::render::{
-    self, collect_sarif, render_compact, render_human, render_json, render_tabular, CliFileOutput,
-    FileReport, LintFormat, RenderOpts, SarifResult, SarifRuleDef,
+    self, collect_sarif, render_agent, render_compact, render_human, render_json, render_tabular,
+    CliFileOutput, FileReport, LintFormat, RenderOpts, SarifResult, SarifRuleDef, AGENT_PASS,
 };
 use crate::cli::render::{use_color, Colors, COLORS_OFF, COLORS_ON};
 use crate::{EXIT_FAILURE, EXIT_GATE};
@@ -399,6 +399,19 @@ pub(crate) fn run_lint_batch(params: &LintBatchParams<'_>) -> Result<()> {
         state.totals.report_telemetry(resolved.len());
     }
 
+    // Agent format says something for a clean run, unlike compact and tabular.
+    // Empty stdout and exit 0 is what a crashed pipeline looks like too, and
+    // the caller here is a model deciding whether it is done: one token is
+    // cheaper than leaving it to guess. Suppressed when a file was skipped, for
+    // the same reason the gate below is: the verdict covers a set the run did
+    // not finish reading.
+    if matches!(params.format, LintFormat::Agent)
+        && state.agent_lines == 0
+        && state.failed_files == 0
+    {
+        println!("{AGENT_PASS}");
+    }
+
     // Exit codes are a contract with CI (see docs/cli.md): 1 means the text
     // failed a gate, 2 means the tool could not do its job. A skipped file
     // outranks a gate result, because the gate was computed over an incomplete
@@ -633,6 +646,11 @@ struct BatchState {
     baseline: zhtw_mcp::baseline::Baseline,
     baseline_count: usize,
     tabular_header_printed: bool,
+    /// Agent-format lines emitted so far, across every file in the batch.
+    /// The `PASS` line is the whole output of a run that found nothing, and a
+    /// run is only that when no file contributed a line, so the count has to
+    /// be batch-wide rather than per file.
+    agent_lines: usize,
     /// Files that could not be processed at all: unreadable, oversized, or not
     /// UTF-8.  Counted rather than propagated, so one bad file in a directory
     /// does not throw away the findings for every other file.
@@ -1136,6 +1154,9 @@ fn process_scanned_file(
         LintFormat::Compact => render_compact(&report, params.explain),
         LintFormat::Tabular => {
             render_tabular(&report, params.explain, &mut state.tabular_header_printed);
+        }
+        LintFormat::Agent => {
+            state.agent_lines += render_agent(&report, params.explain);
         }
         LintFormat::Sarif => {
             collect_sarif(&report, &mut state.sarif_rules, &mut state.sarif_results)

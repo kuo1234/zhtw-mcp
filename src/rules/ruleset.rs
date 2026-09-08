@@ -1189,6 +1189,37 @@ impl Issue {
         }
     }
 
+    /// True when no fix tier can settle this issue from the issue alone, so
+    /// the answer belongs to whoever is reading the sentence.
+    ///
+    /// This is the issue-intrinsic half of the fixer's verdict, and only that
+    /// half: the tier the run asked for, the excluded regions, and whether a
+    /// segmenter was available are all properties of the run rather than of
+    /// the finding, and the caller here has none of them. So the four reasons
+    /// below are the ones that hold however the fixer is invoked. Several
+    /// candidates is a choice; a clue-gated term needs the surrounding domain;
+    /// an `editorial_confidence: low` annotation is the ruleset saying the
+    /// flagged form is valid zh-TW in some register; and an anchor rejection
+    /// under `--verify` is the translation disagreeing with the rule.
+    ///
+    /// Orthographic issue types bypass the middle two in the fixer, so they do
+    /// here as well, and arity is the only thing left that can stop one.
+    ///
+    /// `tests/corpus-evaluation.rs` holds the two together over every corpus:
+    /// an issue this calls a judgment call and `lexical_safe` rewrote anyway is
+    /// the drift this arrangement can produce, and it is silent without a gate.
+    pub fn needs_judgment(&self) -> bool {
+        if self.suggestions.len() > 1 {
+            return true;
+        }
+        if self.rule_type.is_orthographic() {
+            return false;
+        }
+        self.context_clues.as_ref().is_some_and(|c| !c.is_empty())
+            || self.editorial_confidence == Some(EditorialConfidence::Low)
+            || self.anchor_match == Some(false)
+    }
+
     /// Grouping key for deduplication in compact output.
     /// Issues with identical (found, rule_type, suggestions, severity) are
     /// collapsible.
