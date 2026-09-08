@@ -379,8 +379,32 @@ fn the_fingerprint_moves_when_a_configured_pack_changes() {
     let after = rules_fingerprint(&overrides, None, &tm, std::slice::from_ref(&pack));
     assert_ne!(before, after, "editing a configured pack must re-scan");
 
-    // A pack the config does not name changes nothing.
-    let unrelated = rules_fingerprint(&overrides, None, &tm, &[]);
-    assert_ne!(unrelated, after);
-    assert_eq!(unrelated, rules_fingerprint(&overrides, None, &tm, &[]));
+    // A pack the config does not name changes nothing, which has to be shown by
+    // editing that pack rather than by hashing the same inputs twice.
+    let other = dir.path().join("unnamed.json");
+    std::fs::write(&other, r#"{"schema_version":3,"spelling":[]}"#).unwrap();
+    let without = rules_fingerprint(&overrides, None, &tm, &[]);
+    std::fs::write(&other, r#"{"schema_version":3,"spelling":[{"from":"y"}]}"#).unwrap();
+    assert_eq!(
+        without,
+        rules_fingerprint(&overrides, None, &tm, &[]),
+        "a pack the config does not name must not move the digest"
+    );
+}
+
+#[test]
+fn a_pack_name_cannot_escape_the_packs_directory() {
+    // The config is project controlled, so a clone can carry one. The scan path
+    // already refuses these names; the fingerprint has to refuse the same ones
+    // or it reads a file the scan would never open.
+    let dir = tempfile::tempdir().unwrap();
+    let store = zhtw_mcp::rules::store::PackStore::new(dir.path().to_path_buf());
+    for name in ["../escape", "..", "a/b", "a\\b", "", "."] {
+        assert!(
+            store.pack_path(name).is_err(),
+            "pack name {name:?} should be refused"
+        );
+    }
+    let ok = store.pack_path("medical").unwrap();
+    assert_eq!(ok.parent(), Some(dir.path()));
 }

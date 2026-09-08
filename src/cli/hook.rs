@@ -105,14 +105,19 @@ fn callback_inner(payload_json: &str, cache_path: &Path) -> Option<String> {
 
     // The packs the scan will merge, by file, so installing or editing one
     // moves the digest. A pack decides findings now, so a cached verdict that
-    // ignored it would answer for a rule set that has since changed.
-    let packs_dir = zhtw_mcp::rules::store::default_packs_dir();
+    // ignored it would answer for a rule set that has since changed. Through
+    // PackStore, which validates the name: the config is project controlled,
+    // and a name carrying a separator or ".." would otherwise reach a path
+    // outside the packs directory. The scan already refuses those, and the
+    // digest has to refuse the same ones.
+    let pack_store =
+        zhtw_mcp::rules::store::PackStore::new(zhtw_mcp::rules::store::default_packs_dir());
     let pack_paths: Vec<PathBuf> = project_cfg
         .as_ref()
         .and_then(|c| c.packs.as_deref())
         .unwrap_or_default()
         .iter()
-        .map(|name| packs_dir.join(format!("{name}.json")))
+        .filter_map(|name| pack_store.pack_path(name).ok())
         .collect();
     let fingerprint = rules_fingerprint(
         &overrides_path,
