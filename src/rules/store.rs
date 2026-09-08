@@ -887,7 +887,6 @@ impl PackStore {
         packs
     }
 
-    /// Load a pack by name.
     /// The file a pack name resolves to, once the name is known to be a plain
     /// component. Public so a caller that needs the path without the contents,
     /// such as the hook's cache fingerprint, cannot re-derive it and skip the
@@ -897,6 +896,7 @@ impl PackStore {
         Ok(self.dir.join(format!("{name}.json")))
     }
 
+    /// Load a pack by name.
     pub fn load(&self, name: &str) -> Result<Overrides> {
         let path = self.pack_path(name)?;
         let content = std::fs::read_to_string(&path)
